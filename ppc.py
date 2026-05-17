@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
 Speed Roulette 2 — Bot de señales para Docenas y Columnas
-Sistema PF + PH + ML Cruzado + Gestión Docenas (6 niveles, 2 oportunidades)
+Conectado al Stats Server para datos históricos en tiempo real.
 
-  - Capital inicial: 0
-  - Apuesta base: 0.50 por docena/columna
-  - Gestión: 6 niveles con 2 oportunidades (Gale #0 y Gale #1) por señal.
-      · Gale #0 → apuesta = nivel × BASE_BET
-      · Gale #1 → apuesta = 3 × (nivel × BASE_BET)  [Gestión conservadora x3]
-  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel.
-  - EMPATE (cero): termina la señal, sin cambio de bankroll.
-  - Sin base de datos de pre-entrenamiento (solo datos nuevos).
-  - WS Key: 205
+  - Formato de señales con montos por país (USD, MXN, PEN, COP, ARS, CLP).
+  - Cero se calcula al 10% de la apuesta base por docena/columna.
+  - Segunda oportunidad header: "🚨 SEGUNDA OPORTUNIDAD 🚨".
+  - Estadísticas globales en USD.
 """
 
 import asyncio
@@ -43,7 +38,7 @@ logger = logging.getLogger("Speed2DC")
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
-# ─── TELEGRAM — SPEED ROULETTE 2 ─────────────────────────────────────────────
+# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN   = "8714149875:AAFJugWY0E5A4C0lrxn2bMcKsQEieqo_t5M"
 CHAT_ID = -1003630680656
 
@@ -56,9 +51,8 @@ bot = telebot.TeleBot(TOKEN, threaded=False)
 bot.session = _session
 
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
-WS_URL      = "wss://dga.pragmaticplaylive.net/ws"
-CASINO_ID   = "ppcjd00000007254"
-WS_KEY      = 205
+STATS_WS_URL = "wss://ruletasbot-rjce.onrender.com/ws"
+TARGET_ROULETTE = "SPEED2"
 LIVE_DB     = "speed2_live.db"
 
 BASE_BET       = 0.50
@@ -66,6 +60,32 @@ MAX_NIVEL      = 6
 WARMUP_SPINS   = 25
 MIN_PROB       = 0.78
 TRAIN_INTERVAL = 100
+
+PF_W_NORM  = 0.65; PH_W_NORM  = 0.35
+BASE_W_NORM = 0.50; ML_W_NORM   = 0.50
+
+PF_W_GALE1  = 0.30; PH_W_GALE1  = 0.70
+BASE_W_GALE1 = 0.65; ML_W_GALE1   = 0.35
+MIN_PROB_GALE1 = 0.70
+
+# ─── MULTIPLICADORES DE MONEDA (Relativos a USD 1.00) ────────────────────────
+CURRENCY_MULTIPLIERS = {
+    "USD": 1.0,
+    "MXN": 20.0,
+    "PEN": 5.0,
+    "COP": 5000.0,
+    "ARS": 1500.0,
+    "CLP": 1000.0
+}
+CURRENCY_SYMBOLS = {
+    "USD": "$", "MXN": "$", "PEN": "S/.", "COP": "$", "ARS": "$", "CLP": "$"
+}
+CURRENCY_FLAGS = {
+    "USD": "🇺🇲", "MXN": "🇲🇽", "PEN": "🇵🇪", "COP": "🇨🇴", "ARS": "🇦🇷", "CLP": "🇨🇱"
+}
+CURRENCY_DECIMALS = {
+    "USD": 2, "MXN": 2, "PEN": 2, "COP": 0, "ARS": 0, "CLP": 0
+}
 
 REAL_COLOR_MAP: dict[int, str] = {
     0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",
@@ -118,6 +138,37 @@ def tg_delete(chat_id: int, message_id: int):
         _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
     except:
         pass
+
+# ─── CLIENTE DEL STATS SERVER ─────────────────────────────────────────────────
+class StatsClient:
+    def __init__(self):
+        self.stats_dozen = {}
+        self.stats_column = {}
+        self.last_20 = []
+        self.last_50 = []
+        self.total_spins = 0
+        self.connected = False
+
+    def update_from_server(self, data: dict):
+        self.last_20 = data.get("last_20", self.last_20)
+        self.last_50 = data.get("last_50", self.last_50)
+        self.stats_dozen = data.get("stats_dozen", self.stats_dozen)
+        self.stats_column = data.get("stats_column", self.stats_column)
+        self.total_spins = data.get("total_spins", self.total_spins)
+
+    def get_ph_from_stats(self, number: int, cat_type: str) -> Optional[Dict]:
+        stats = self.stats_column if cat_type == "COLUMNA" else self.stats_dozen
+        num_key = str(number)
+        if num_key not in stats: return None
+        data = stats[num_key]
+        if data.get("total", 0) < 10: return None
+        probs = {1: data.get("1", 0), 2: data.get("2", 0), 3: data.get("3", 0)}
+        sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+        if sorted_probs[0][1] == 0: return None
+        pair = tuple(sorted([sorted_probs[0][0], sorted_probs[1][0]]))
+        missing = list({1, 2, 3} - set(pair))[0]
+        prob = (sorted_probs[0][1] + sorted_probs[1][1]) / 100.0
+        return {"pair": pair, "missing": missing, "prob": prob}
 
 # ─── EMA ──────────────────────────────────────────────────────────────────────
 def calc_ema(data: list, period: int) -> list:
@@ -223,7 +274,7 @@ class OnlineEnsemblePredictor:
             return {c + 1: float(p) for c, p in enumerate(final)}
         except: return None
 
-# ─── GESTOR DOCENAS (GESTIÓN X3 CONSERVADORA) ────────────────────────────────
+# ─── GESTOR DOCENAS ───────────────────────────────────────────────────────────
 class GestorDocenas:
     def __init__(self):
         self.nivel = 1
@@ -253,7 +304,7 @@ class GestorDocenas:
             self.nivel += 1
         else:
             self.nivel = 1
-        logger.info(f"[Speed2DC] 📋 Deuda registrada: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} deudas | Nivel→{self.nivel}")
+        logger.info(f"[Speed2DC] 📋 Deuda registrada: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} | Nivel→{self.nivel}")
 
     def verificar_recuperacion(self, balance_actual: float):
         while self.debt_stack:
@@ -298,23 +349,26 @@ class DetailedStats:
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Balance actual: 💰 {bankroll:.2f}\n"
+        text += f"► Balance actual: 💰 ${bankroll:.2f} USD\n"
         text += f"► Total señales procesadas: {total}\n\n"
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
             a_str = f"🔄 GALE #{s['attempt']}"
-            b_str = f"💰 {s['balance']:.2f}"
+            b_str = f"💰 ${s['balance']:.2f} USD"
+            val_str = f"D{s['val']}" if s['type'] == 'DOCENA' else f"C{s['val']}"
             if s['result'] == 'WIN':
-                text += f"✅ WIN #{s['number']} {s['type']} {s['val']} | {a_str} | {b_str}\n"
+                text += f"✅ WIN #{s['number']} {s['type']} {val_str} | {a_str} | {b_str}\n"
             elif s['result'] == 'EMPATE':
-                text += f"🟠 EMPATE #0 ZERO | {a_str} | {b_str}\n"
+                text += f"🟠 EMPATE ZERO | {a_str} | {b_str}\n"
             else:
-                text += f"🚫 LOSS #{s['number']} {s['type']} {s['val']} | {a_str} | {b_str}\n"
+                text += f"🚫 LOSS #{s['number']} {s['type']} {val_str} | {a_str} | {b_str}\n"
         return text
 
 # ─── ENGINE ───────────────────────────────────────────────────────────────────
 class Speed2RouletteEngine:
-    def __init__(self):
+    def __init__(self, stats_client: StatsClient):
+        self.stats_client = stats_client
+
         self.spin_history: list = []
         self.dozen_seq: list = []; self.column_seq: list = []
         self.d_levels: dict = {1: [], 2: [], 3: []}
@@ -331,12 +385,14 @@ class Speed2RouletteEngine:
         self.gestor = GestorDocenas()
         self.total_signal_loss = 0.0
         self.bankroll: float = 0.0
-        self.trigger_number = 0; self.trigger_color = ""
         self.stats = DetailedStats()
         self._db = _get_db()
         self.spins_since_train = 0
-        self.last_game_id = None
         self.active_signal_msg_id = None
+
+        self.gale1_changed = False
+        self.gale1_change_desc = ""
+        self.original_pair = ()
 
         live_loaded  = self._load_live_history()
         total = live_loaded
@@ -409,6 +465,11 @@ class Speed2RouletteEngine:
         if not self.spin_history: return None
         last_num = self.spin_history[-1]["number"]
         if last_num == 0: return None
+
+        server_ph = self.stats_client.get_ph_from_stats(last_num, cat_type)
+        if server_ph:
+            return server_ph
+
         counts = self.after_number_dozen.get(last_num, {}) if cat_type == "DOCENA" else self.after_number_column.get(last_num, {})
         total = sum(counts.values())
         if total < 10: return None
@@ -443,33 +504,119 @@ class Speed2RouletteEngine:
         ph_d = self._get_ph("DOCENA"); ph_c = self._get_ph("COLUMNA")
         candidates = []
         if pf_d and ph_d and set(pf_d["pair"]) == set(ph_d["pair"]):
-            base = 0.65 * pf_d["prob"] + 0.35 * ph_d["prob"]
+            base = PF_W_NORM * pf_d["prob"] + PH_W_NORM * ph_d["prob"]
             ml   = self._predict_pair_ml("DOCENA", pf_d["missing"])
-            prob = 0.5 * base + 0.5 * ml
+            prob = BASE_W_NORM * base + ML_W_NORM * ml
             logger.info(f"[Speed2DC] D base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
             if prob >= MIN_PROB:
                 candidates.append({"type":"DOCENA","pair":tuple(f"D{x}" for x in sorted(pf_d["pair"])),"missing":f"D{pf_d['missing']}","prob":prob})
         if pf_c and ph_c and set(pf_c["pair"]) == set(ph_c["pair"]):
-            base = 0.65 * pf_c["prob"] + 0.35 * ph_c["prob"]
+            base = PF_W_NORM * pf_c["prob"] + PH_W_NORM * ph_c["prob"]
             ml   = self._predict_pair_ml("COLUMNA", pf_c["missing"])
-            prob = 0.5 * base + 0.5 * ml
+            prob = BASE_W_NORM * base + ML_W_NORM * ml
             logger.info(f"[Speed2DC] C base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
             if prob >= MIN_PROB:
                 candidates.append({"type":"COLUMNA","pair":tuple(f"C{x}" for x in sorted(pf_c["pair"])),"missing":f"C{pf_c['missing']}","prob":prob})
         return max(candidates, key=lambda x: x["prob"]) if candidates else None
 
+    # ═══ RE-ANÁLISIS GALE #1 ════════════════════════════════════════════════
+    def _reanalyze_for_gale1(self, original_type: str, original_pair: tuple) -> dict:
+        pf = self._get_pf(original_type)
+        ph = self._get_ph(original_type)
+        prefix = "D" if original_type == "DOCENA" else "C"
+        cat_str = "docenas" if original_type == "DOCENA" else "columnas"
+
+        if not pf or not ph:
+            reason = "PF no disponible" if not pf else "PH no disponible"
+            logger.info(f"[Speed2DC] 🔄 Re-análisis: {reason} → mantener original")
+            return {"pair": original_pair, "missing": "", "prob": 0.0, "changed": False, "change_desc": f"{reason}, se mantiene señal original"}
+
+        if set(pf["pair"]) != set(ph["pair"]):
+            logger.info(f"[Speed2DC] 🔄 Re-análisis: PF y PH no coinciden → mantener original")
+            return {"pair": original_pair, "missing": "", "prob": 0.0, "changed": False, "change_desc": "PF y PH no coinciden, se mantiene señal original"}
+
+        base = PF_W_GALE1 * pf["prob"] + PH_W_GALE1 * ph["prob"]
+        ml   = self._predict_pair_ml(original_type, pf["missing"])
+        prob = BASE_W_GALE1 * base + ML_W_GALE1 * ml
+
+        new_pair = tuple(f"{prefix}{x}" for x in sorted(pf["pair"]))
+        same_as_original = set(new_pair) == set(original_pair)
+
+        logger.info(f"[Speed2DC] 🔍 Re-análisis {original_type} | PF={pf['prob']:.0%} PH={ph['prob']:.0%} base={base:.0%} ml={ml:.0%} final={prob:.0%}")
+
+        if prob < MIN_PROB_GALE1:
+            return {"pair": original_pair, "missing": "", "prob": prob, "changed": False, "change_desc": f"Prob {prob:.0%} insuficiente, se mantiene señal original"}
+
+        if same_as_original:
+            return {"pair": new_pair, "missing": f"{prefix}{pf['missing']}", "prob": prob, "changed": False, "change_desc": f"Señal confirmada por re-análisis (prob {prob:.0%})"}
+
+        orig_nums = sorted([p[1:] for p in original_pair])
+        new_nums  = sorted([p[1:] for p in new_pair])
+        desc = f"Cambio en {cat_str}: {prefix}{orig_nums[0]} y {prefix}{orig_nums[1]} → {prefix}{new_nums[0]} y {prefix}{new_nums[1]} (prob {prob:.0%})"
+        return {"pair": new_pair, "missing": f"{prefix}{pf['missing']}", "prob": prob, "changed": True, "change_desc": desc}
+
+    # ═══ FORMATO DE MONTO POR PAÍS ═════════════════════════════════════════
+    def _format_bets(self, bet_usd: float, type_str: str) -> str:
+        """Formatear montos de apuesta por país. Cero = 10% de la apuesta."""
+        zero_usd = bet_usd * 0.10
+        lines = []
+        for curr in ["USD", "MXN", "PEN", "COP", "ARS", "CLP"]:
+            flag = CURRENCY_FLAGS[curr]
+            sym = CURRENCY_SYMBOLS[curr]
+            mult = CURRENCY_MULTIPLIERS[curr]
+            dec = CURRENCY_DECIMALS[curr]
+            
+            main_val = bet_usd * mult
+            zero_val = zero_usd * mult
+            
+            lines.append(f"{flag} {curr}: {sym}{main_val:.{dec}f} x {type_str} + Cero: {sym}{zero_val:.{dec}f}")
+        
+        return "\n".join(lines)
+
+    # ═══ SEÑALES Y RESOLUCIÓN ══════════════════════════════════════════════
     def _build_signal_text(self) -> str:
-        bet = self.gestor.apostar_por_docena(self.bankroll)
+        bet_usd = self.gestor.apostar_por_docena(self.bankroll)
         nums = sorted([p[1:] for p in self.active_pair])
-        pair_disp = f"{nums[0]} y {nums[1]}"
-        type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        return (f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
-                f"🕹️ Roulette Speed 2\n"
-                f"🎯 Entrar en las {type_str}: {pair_disp}\n"
-                f"💰 Balance: {self.bankroll:.2f}\n"
-                f"💵 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
-                f"⚔️ Cubrir el CERO 🟢\n"
-                f"🛟 Max: 1 Gales")
+        prefix = "D" if self.active_type == "DOCENA" else "C"
+        pair_disp = f"{prefix}{nums[0]} y {prefix}{nums[1]}"
+        
+        if self.active_type == "DOCENA":
+            cat_label = "Docenas"
+            bet_label = "Docena"
+        else:
+            cat_label = "Columnas"
+            bet_label = "Columna"
+
+        # Header según oportunidad
+        if self.gestor.oportunidad == 1:
+            header = "✅✅ ENTRADA CONFIRMADA ✅✅"
+        else:
+            header = "🚨 SEGUNDA OPORTUNIDAD 🚨"
+
+        # Detalle de cambio si es Gale #1
+        change_info = ""
+        if self.gestor.oportunidad == 2:
+            if self.gale1_changed:
+                orig_nums = sorted([p[1:] for p in self.original_pair])
+                orig_prefix = "D" if self.active_type == "DOCENA" else "C"
+                orig_disp = f"{orig_prefix}{orig_nums[0]} y {orig_prefix}{orig_nums[1]}"
+                orig_cat = "Docenas" if self.active_type == "DOCENA" else "Columnas"
+                change_info = (f"\n⚡ Antes: {orig_cat} {orig_disp}"
+                               f"\n📍 Ahora: {cat_label} {pair_disp}"
+                               f"\n📝 {self.gale1_change_desc}\n")
+            else:
+                change_info = f"\n📝 {self.gale1_change_desc}\n"
+
+        # Formatear montos
+        bets_text = self._format_bets(bet_usd, bet_label)
+
+        return (f"{header}\n\n"
+                f"🕹️ SPEED ROULETTE 2\n"
+                f"🎯 {cat_label}: {pair_disp}\n"
+                f"⚔️ Cubrir el CERO 🟢\n\n"
+                f"🚨 MONTO DE APUESTA POR PAIS:\n"
+                f"{bets_text}"
+                f"{change_info}")
 
     def _send_signal(self):
         msg_id = tg_send(self._build_signal_text())
@@ -481,13 +628,14 @@ class Speed2RouletteEngine:
         type_str = self.active_type
         val_num  = d if type_str == "DOCENA" else c
         gale_num = self.gestor.oportunidad - 1
+        val_prefix = "D" if type_str == "DOCENA" else "C"
+        val_display = f"{val_prefix}{val_num}"
 
-        bet = self.gestor.apostar_por_docena(self.bankroll)
+        bet_usd = self.gestor.apostar_por_docena(self.bankroll)
 
         if number == 0:
             tg_send(f"🟠 EMPATE {number} — ZERO — 🔄 GALE #{gale_num}\n"
-                    f"🉑 Para la próxima ganaremos 0.00 🉑\n"
-                    f"💰 Balance actual: {self.bankroll:.2f}")
+                    f"💰 Balance actual: ${self.bankroll:.2f} USD")
             self.stats.record('EMPATE', gale_num, 0, 0, type_str, self.bankroll)
             self._check_stats(); self._reset_signal()
             return
@@ -496,19 +644,25 @@ class Speed2RouletteEngine:
               (type_str == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair)
 
         if won:
-            profit = bet
+            profit = bet_usd
             self.bankroll = round(self.bankroll + profit, 2)
             self.gestor.verificar_recuperacion(self.bankroll)
 
-            tg_send(f"✅ WIN {number} — {type_str} {val_num} — 🔄 GALE #{gale_num}\n"
-                    f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
-                    f"💰 Balance actual: {self.bankroll:.2f}")
+            extra = ""
+            if gale_num == 1 and self.gale1_changed:
+                orig_nums = sorted([p[1:] for p in self.original_pair])
+                orig_prefix = "D" if type_str == "DOCENA" else "C"
+                extra = f" (par actualizado de {orig_prefix}{orig_nums[0]} y {orig_prefix}{orig_nums[1]})"
+
+            tg_send(f"✅ WIN {number} — {type_str} {val_display} — 🔄 GALE #{gale_num}{extra}\n"
+                    f"🎉 Felicidades has ganado ${profit:.2f} USD 🎉\n"
+                    f"💰 Balance actual: ${self.bankroll:.2f} USD")
 
             self.stats.record('WIN', gale_num, number, val_num, type_str, self.bankroll)
             self._check_stats()
             self._reset_signal()
         else:
-            loss = bet * 2
+            loss = bet_usd * 2
             self.bankroll = round(self.bankroll - loss, 2)
             self.total_signal_loss = round(self.total_signal_loss + loss, 2)
 
@@ -516,17 +670,42 @@ class Speed2RouletteEngine:
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
-                
+
+                self.original_pair = self.active_pair
+                reanalysis = self._reanalyze_for_gale1(self.active_type, self.active_pair)
+
+                self.active_pair = reanalysis["pair"]
+                self.active_missing = reanalysis.get("missing", "")
+                self.gale1_changed = reanalysis["changed"]
+                self.gale1_change_desc = reanalysis["change_desc"]
+
+                cat_str = "docenas" if self.active_type == "DOCENA" else "columnas"
+                nums = sorted([p[1:] for p in self.active_pair])
+                prefix = "D" if self.active_type == "DOCENA" else "C"
+
+                if self.gale1_changed:
+                    orig_nums = sorted([p[1:] for p in self.original_pair])
+                    orig_prefix = "D" if self.active_type == "DOCENA" else "C"
+                    tg_send(f"🔄 <b>RE-ANÁLISIS GALE #1</b> — Par actualizado\n\n"
+                            f"❌ Pérdida en Gale #0 con #{number}\n"
+                            f"📍 Antes: {cat_str} {orig_prefix}{orig_nums[0]} y {orig_prefix}{orig_nums[1]}\n"
+                            f"✅ Ahora: {cat_str} {prefix}{nums[0]} y {prefix}{nums[1]}\n"
+                            f"📝 {self.gale1_change_desc}")
+                else:
+                    tg_send(f"🔄 <b>RE-ANÁLISIS GALE #1</b> — Mantenida señal original\n\n"
+                            f"❌ Pérdida en Gale #0 con #{number}\n"
+                            f"📌 {cat_str} {prefix}{nums[0]} y {prefix}{nums[1]}\n"
+                            f"📝 {self.gale1_change_desc}")
+
                 self.gestor.oportunidad = 2
                 self._send_signal()
             else:
-                tg_send(f"❌ LOSS {number} — {type_str} {val_num} — 🔄 GALE #1\n"
-                        f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
-                        f"💰 Balance actual: {self.bankroll:.2f}")
+                tg_send(f"❌ LOSS {number} — {type_str} {val_display} — 🔄 GALE #1\n"
+                        f"🚨 Señal perdida. Monto perdido: -${self.total_signal_loss:.2f} USD 🚨\n"
+                        f"💰 Balance actual: ${self.bankroll:.2f} USD")
 
                 self.stats.record('LOSS', 1, number, val_num, type_str, self.bankroll)
                 self.gestor.registrar_perdida_senal()
-
                 self._check_stats()
                 self._reset_signal()
 
@@ -536,6 +715,9 @@ class Speed2RouletteEngine:
         self.active_type = None
         self.total_signal_loss = 0.0
         self.active_signal_msg_id = None
+        self.gale1_changed = False
+        self.gale1_change_desc = ""
+        self.original_pair = ()
 
     def _check_stats(self):
         if not self.stats.should_send(): return
@@ -566,53 +748,67 @@ class Speed2RouletteEngine:
                 self.active_pair = sig["pair"]; self.active_missing = sig["missing"]
                 self.gestor.iniciar_senal(self.bankroll)
                 self.total_signal_loss = 0.0
+                self.gale1_changed = False
+                self.gale1_change_desc = ""
+                self.original_pair = sig["pair"]
                 self._send_signal()
                 logger.info(f"[Speed2DC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
+    # ═══ CONEXIÓN AL STATS SERVER ══════════════════════════════════════════
     async def run_ws(self):
         reconnect_delay = 5
         while True:
             try:
-                async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
-                    await ws.send(json.dumps({"type": "subscribe", "key": WS_KEY, "casinoId": CASINO_ID}))
-                    logger.info(f"[Speed2DC] ✅ WS conectado — Speed Roulette 2 key={WS_KEY}")
+                async with websockets.connect(STATS_WS_URL, ping_interval=30, ping_timeout=60) as ws:
+                    await ws.send(json.dumps({"type": "subscribe", "roulette": TARGET_ROULETTE}))
+                    logger.info(f"[Speed2DC] ✅ Conectado al Stats Server — Suscrito a {TARGET_ROULETTE}")
                     reconnect_delay = 5
+                    self.stats_client.connected = True
+                    
                     async for raw in ws:
-                        try: data = json.loads(raw)
-                        except: continue
-                        if not isinstance(data, dict): continue
-                        results = data.get("last20Results")
-                        if results and isinstance(results, list):
-                            latest = results[0]
-                            gid = str(latest.get("gameId", ""))
-                            if gid == self.last_game_id: continue
-                            self.last_game_id = gid
-                            try: n = int(latest.get("result", ""))
-                            except: continue
-                            if 0 <= n <= 36: self.process_number(n)
+                        try:
+                            data = json.loads(raw)
+                            msg_type = data.get("type")
+                            
+                            if msg_type == "welcome":
+                                logger.info(f"[Speed2DC] Servidor disponible: {list(data.get('available_roulettes', {}).keys())}")
+                            
+                            elif msg_type == "full_state":
+                                self.stats_client.update_from_server(data["data"])
+                                logger.info(f"[Speed2DC] 📊 Estado completo: {data['data'].get('total_spins', 0)} giros históricos")
+                            
+                            elif msg_type == "new_spin":
+                                spin_data = data["data"]
+                                n = spin_data.get("number")
+                                self.stats_client.update_from_server(spin_data)
+                                if n is not None and 0 <= n <= 36:
+                                    self.process_number(n)
+                                    
+                        except json.JSONDecodeError:
                             continue
-                        for key in ("result", "number", "outcome", "winningNumber"):
-                            if key in data:
-                                try:
-                                    n = int(data[key])
-                                    if 0 <= n <= 36: self.process_number(n)
-                                except: pass
-                                break
+                            
             except Exception as e:
-                logger.warning(f"[Speed2DC] WS desconectado: {e}. Recon en {reconnect_delay}s")
+                self.stats_client.connected = False
+                logger.warning(f"[Speed2DC] Stats Server desconectado: {e}. Recon en {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
+
 
 # ─── FLASK ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 engine: Optional[Speed2RouletteEngine] = None
 
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Speed 2 DC", "key": WS_KEY})
+def home(): return jsonify({"status": "ok", "bot": "Speed 2 DC", "stats_server": STATS_WS_URL})
 @app.route("/ping")
 def ping(): return jsonify({"status": "pong", "ts": time.time()})
 @app.route("/health")
-def health(): return jsonify({"warmup": engine.warmup_done if engine else False, "spins": len(engine.spin_history) if engine else 0, "balance": engine.bankroll if engine else 0})
+def health(): return jsonify({
+    "warmup": engine.warmup_done if engine else False,
+    "spins": len(engine.spin_history) if engine else 0,
+    "balance": f"${engine.bankroll:.2f} USD" if engine else 0,
+    "stats_connected": engine.stats_client.connected if engine else False
+})
 
 async def self_ping_loop():
     url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -623,14 +819,19 @@ async def self_ping_loop():
         except: pass
         await asyncio.sleep(240)
 
+# ─── TELEGRAM COMMANDS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
-def cmd_start(m): bot.reply_to(m, "<b>🎰 Speed Roulette 2 DC</b>\n\nApuesta: 0.50 por D/C\nCapital: 0\nKey WS: 205\n\n/status /stats /reset", parse_mode="HTML")
+def cmd_start(m): bot.reply_to(m, "<b>🎰 Speed Roulette 2 DC</b>\n\nApuesta: 0.50 USD base\nCapital: 0\nServidor: Stats Server\n\n/status /stats /reset", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
     if not engine: return
     st = f"🟢 {engine.active_pair}" if engine.signal_active else "⚪ Idle"
-    bot.reply_to(m, f"<b>Estado:</b> {st}\n<b>Giros:</b> {len(engine.spin_history)}\n<b>Balance:</b> {engine.bankroll:.2f}", parse_mode="HTML")
+    conn = "🟢 Conectado" if engine.stats_client.connected else "🔴 Desconectado"
+    extra = ""
+    if engine.signal_active and engine.gestor.oportunidad == 2:
+        extra = f" (Gale #1{' ✏️' if engine.gale1_changed else ' 📌'})"
+    bot.reply_to(m, f"<b>Estado:</b> {st}{extra}\n<b>Giros:</b> {len(engine.spin_history)}\n<b>Balance:</b> ${engine.bankroll:.2f} USD\n<b>Nivel:</b> {engine.gestor.nivel}\n<b>Stats Server:</b> {conn}", parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
 def cmd_stats(m):
@@ -640,16 +841,20 @@ def cmd_stats(m):
 @bot.message_handler(commands=['reset'])
 def cmd_reset(m):
     if engine: engine.stats = DetailedStats(); engine.bankroll = 0.0; engine.gestor.nivel = 1; engine.gestor.debt_stack = []
-    bot.reply_to(m, "🔄 <b>Resetado — Balance: 0.00</b>", parse_mode="HTML")
+    bot.reply_to(m, "🔄 <b>Resetado — Balance: $0.00 USD</b>", parse_mode="HTML")
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10003)), debug=False, use_reloader=False)
 
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
     global engine
-    engine = Speed2RouletteEngine()
+    stats_client = StatsClient()
+    engine = Speed2RouletteEngine(stats_client)
+    
     threading.Thread(target=lambda: bot.polling(none_stop=True, interval=1, timeout=30), daemon=True).start()
-    logger.info("[Speed2DC] 🎰 Bot Speed 2 iniciado — key=205")
+    logger.info("[Speed2DC] 🎰 Bot Speed 2 iniciado — Conectado a Stats Server")
+    
     await asyncio.gather(asyncio.create_task(engine.run_ws()), asyncio.create_task(self_ping_loop()))
 
 if __name__ == "__main__":
