@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-Speed Roulette 2 — Bot con Polling HTTP cada 1 segundo
+Russian Roulette — Bot DC con Polling HTTP cada 1 segundo
 ===========================================================================
-CAMBIOS v27 (FIXED):
-  - Cada señal = 1 intento (sin gale inmediato)
-  - Al perder señal → envía "🚨 ANALIZANDO 2° OPORTUNIDAD 🚨" y espera
-    a que se detecte una NUEVA señal natural (≥80%) para usarla como 2da oportunidad
-  - Al confirmar nueva señal → borra mensaje de análisis y envía "🚨 SEGUNDA OPORTUNIDAD 🚨"
-  - MIN_PROB = 0.80 (ambas oportunidades deben superar 80%)
-
-CORRECCIONES:
-  - Cero: se apuesta 10% de la ficha. Al ganar D/C se descuenta zero_bet.
-    Al ganar el cero se descuentan las apuestas D/C. (igual lógica v26)
-  - Stats: sólo se registra el resultado FINAL de la señal (la 1ra pérdida
-    no se cuenta como LOSS, solo se espera la 2da oportunidad), igual a v26
-  - registrar_perdida_senal() y subida de nivel: SOLO cuando falla la 2da oportunidad
-  - Análisis de predicciones adaptado al nuevo servidor HTTP (Render)
-  - Umbral 80% en ambas oportunidades
+CAMBIOS v28 (RUSSIAN + PHF):
+  - TARGET_ROULETTE = "RUSSIAN" (key=221 en el servidor Render)
+  - PHF = PHTML(65%) + PH(35%) ponderado por docena
+    * PHTML: señales predefinidas de la tabla del HTML (por número)
+    * PH: histórico del servidor Render (post-número)
+    * PHF blendea ambas y calcula las probabilidades de las 3 docenas
+  - Predicción final: PF + PHF + ML  (PHF reemplaza a PH en DOCENA)
+  - COLUMNA sigue usando PH directamente (tabla HTML solo tiene docenas)
+  - Si PHF par coincide con PF par → se analiza la señal
+  - PHTML_W = 0.65, PH_W_COMBINE = 0.35 (configurables arriba)
 """
 
 import asyncio
@@ -36,6 +31,7 @@ from sklearn.naive_bayes import MultinomialNB
 from sklearn.linear_model import SGDClassifier
 
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import aiohttp
 from flask import Flask, jsonify
 import requests
@@ -43,14 +39,23 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [Speed2DC] %(levelname)s %(message)s')
-logger = logging.getLogger("Speed2DC")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [RussianDC] %(levelname)s %(message)s')
+logger = logging.getLogger("RussianDC")
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
 # ─── CREDENCIALES ─────────────────────────────────────────────────────────────
 TOKEN   = "8714149875:AAFJugWY0E5A4C0lrxn2bMcKsQEieqo_t5M"
 CHAT_ID = -1003630680656
+
+# ─── URL RULETA RUSSIAN ───────────────────────────────────────────────────────
+RUSSIAN_URL = "https://stake1039.com/es/casino/games/pragmatic-play-russian-roulette"
+
+def russian_keyboard() -> InlineKeyboardMarkup:
+    """Teclado inline con el botón de acceso directo a Russian Roulette."""
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("👆🏻 ACCEDER a RUSSIAN ROULETTE", url=RUSSIAN_URL))
+    return kb
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 _session = requests.Session()
@@ -69,26 +74,31 @@ except Exception as e:
 
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 STATS_URL       = "https://ruletasbot-rjce.onrender.com"
-TARGET_ROULETTE = "SPEED2"
-POLL_INTERVAL   = 1       # segundos
-LIVE_DB         = "speed2_live.db"
+TARGET_ROULETTE = "RUSSIAN"           # ← Ruleta Rusa (key=221 en el servidor)
+POLL_INTERVAL   = 1                   # segundos
+LIVE_DB         = "russian_live.db"   # DB local específica de Russian
 
 BASE_BET        = 0.50
 MAX_NIVEL       = 6
 WARMUP_SPINS    = 25
-MIN_PROB        = 0.80    # umbral 80% — aplica a ambas oportunidades
+MIN_PROB        = 0.80
 TRAIN_INTERVAL  = 100
 
-PF_W_NORM  = 0.65; PH_W_NORM  = 0.35
-BASE_W_NORM = 0.50; ML_W_NORM = 0.50
-PF_W_GALE1 = 0.30; PH_W_GALE1 = 0.70
-BASE_W_GALE1 = 0.65; ML_W_GALE1 = 0.35
+# Pesos para PHF = PHTML(65%) + PH(35%)
+PHTML_W         = 0.65    # peso de la tabla HTML predefinida
+PH_W_COMBINE    = 0.35    # peso del histórico del servidor
+
+# Pesos del cálculo de señal
+PF_W_NORM   = 0.65; PH_W_NORM   = 0.35   # PF vs PHF en base
+BASE_W_NORM = 0.50; ML_W_NORM   = 0.50   # base vs ML en prob final
+PF_W_GALE1  = 0.30; PH_W_GALE1  = 0.70
+BASE_W_GALE1= 0.65; ML_W_GALE1  = 0.35
 MIN_PROB_GALE1 = 0.70
 
-CURRENCY_MULTIPLIERS = {"USD": 1.0, "MXN": 20.0, "PEN": 5.0, "COP": 5000.0, "ARS": 1500.0, "CLP": 1000.0}
-CURRENCY_SYMBOLS     = {"USD": "$", "MXN": "$", "PEN": "S/.", "COP": "$", "ARS": "$", "CLP": "$"}
-CURRENCY_FLAGS       = {"USD": "🇺🇲", "MXN": "🇲🇽", "PEN": "🇵🇪", "COP": "🇨🇴", "ARS": "🇦🇷", "CLP": "🇨🇱"}
-CURRENCY_DECIMALS    = {"USD": 2, "MXN": 2, "PEN": 2, "COP": 0, "ARS": 0, "CLP": 0}
+CURRENCY_MULTIPLIERS = {"USD":1.0,"MXN":20.0,"PEN":5.0,"COP":5000.0,"ARS":1500.0,"CLP":1000.0}
+CURRENCY_SYMBOLS     = {"USD":"$","MXN":"$","PEN":"S/.","COP":"$","ARS":"$","CLP":"$"}
+CURRENCY_FLAGS       = {"USD":"🇺🇲","MXN":"🇲🇽","PEN":"🇵🇪","COP":"🇨🇴","ARS":"🇦🇷","CLP":"🇨🇱"}
+CURRENCY_DECIMALS    = {"USD":2,"MXN":2,"PEN":2,"COP":0,"ARS":0,"CLP":0}
 
 REAL_COLOR_MAP: dict[int, str] = {
     0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",
@@ -98,6 +108,51 @@ REAL_COLOR_MAP: dict[int, str] = {
     28:"NEGRO",29:"NEGRO",30:"ROJO",31:"NEGRO",32:"ROJO",33:"NEGRO",34:"ROJO",
     35:"NEGRO",36:"ROJO",
 }
+
+# ─── TABLA PHTML (extraída del HTML Russian-Roulette-Docena.html) ─────────────
+# Probabilidades predefinidas por número (d1, d2, d3 en porcentaje).
+# Son las señales fijas de la tabla que se ponderan en PHF.
+# id=0 → "NO APOSTAR" (tratado como ausencia de señal PHTML)
+DOZEN_TABLE: Dict[int, Dict[str, int]] = {
+    0:  {"d1": 32, "d2": 32, "d3": 32},   # NO APOSTAR
+    1:  {"d1": 28, "d2": 32, "d3": 36},
+    2:  {"d1": 36, "d2": 28, "d3": 32},
+    3:  {"d1": 24, "d2": 32, "d3": 36},
+    4:  {"d1": 32, "d2": 40, "d3": 24},
+    5:  {"d1": 40, "d2": 24, "d3": 36},
+    6:  {"d1": 32, "d2": 24, "d3": 40},
+    7:  {"d1": 36, "d2": 24, "d3": 40},
+    8:  {"d1": 32, "d2": 36, "d3": 28},
+    9:  {"d1": 28, "d2": 36, "d3": 32},
+    10: {"d1": 40, "d2": 32, "d3": 28},
+    11: {"d1": 36, "d2": 24, "d3": 36},
+    12: {"d1": 32, "d2": 28, "d3": 36},
+    13: {"d1": 32, "d2": 28, "d3": 36},
+    14: {"d1": 16, "d2": 48, "d3": 32},
+    15: {"d1": 36, "d2": 28, "d3": 32},
+    16: {"d1": 28, "d2": 32, "d3": 36},
+    17: {"d1": 20, "d2": 44, "d3": 32},
+    18: {"d1": 32, "d2": 28, "d3": 36},
+    19: {"d1": 36, "d2": 28, "d3": 32},
+    20: {"d1": 36, "d2": 36, "d3": 28},
+    21: {"d1": 24, "d2": 44, "d3": 28},
+    22: {"d1": 36, "d2": 36, "d3": 28},
+    23: {"d1": 24, "d2": 32, "d3": 40},
+    24: {"d1": 44, "d2": 32, "d3": 24},
+    25: {"d1": 36, "d2": 24, "d3": 36},
+    26: {"d1": 40, "d2": 28, "d3": 32},
+    27: {"d1": 32, "d2": 28, "d3": 36},
+    28: {"d1": 36, "d2": 28, "d3": 32},
+    29: {"d1": 32, "d2": 24, "d3": 40},
+    30: {"d1": 36, "d2": 36, "d3": 28},
+    31: {"d1": 32, "d2": 36, "d3": 24},
+    32: {"d1": 32, "d2": 36, "d3": 28},
+    33: {"d1": 28, "d2": 32, "d3": 36},
+    34: {"d1": 36, "d2": 28, "d3": 32},
+    35: {"d1": 36, "d2": 32, "d3": 24},
+    36: {"d1": 28, "d2": 36, "d3": 32},
+}
+
 
 def get_dozen(n: int) -> int:
     if n == 0: return 0
@@ -119,7 +174,6 @@ def _get_db() -> sqlite3.Connection:
 
 _TG_RETRIES = 12
 def _tg_call(fn, *a, **kw):
-    """Retry logic para llamadas a Telegram con backoff exponencial"""
     delay = 2.0
     for attempt in range(1, _TG_RETRIES + 1):
         try:
@@ -142,43 +196,43 @@ def _tg_call(fn, *a, **kw):
             delay = min(delay * 2, 60)
     return None
 
-def tg_send(text: str) -> Optional[int]:
-    """Send message to Telegram with retry logic"""
+def tg_send(text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
     if not text:
-        logger.warning("⚠️ Empty message to send")
         return None
     try:
-        msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML")
+        msg = _tg_call(
+            bot.send_message,
+            chat_id=CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
         if msg:
             logger.info(f"✅ Message sent (ID: {msg.message_id})")
             return msg.message_id
-        else:
-            logger.error(f"❌ Failed to send message to {CHAT_ID}")
-            return None
+        return None
     except Exception as e:
         logger.error(f"❌ Exception in tg_send: {e}")
         return None
 
 def tg_delete(chat_id: int, message_id: int):
-    """Delete message from Telegram"""
     try:
         _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
         logger.info(f"✅ Message deleted (ID: {message_id})")
     except Exception as e:
         logger.warning(f"⚠️ Failed to delete message: {e}")
 
-# ─── CLIENTE STATS (HTTP POLLING — nuevo servidor Render) ────────────────────
+# ─── CLIENTE STATS (HTTP POLLING) ────────────────────────────────────────────
 class StatsClient:
     """
     Recibe stats del servidor Render via HTTP polling.
-    El endpoint /latest/SPEED2 devuelve:
+    GET /latest/RUSSIAN  →
       {
-        "last_20":      [ {"game_id": "...", "number": N}, ... ],
-        "stats_dozen":  { "NUM": {"total": T, "1": p1, "2": p2, "3": p3} },
-        "stats_column": { ... },
+        "last_20":      [{game_id, number}, ...],
+        "stats_dozen":  {"NUM": {"total": T, "1": p1, "2": p2, "3": p3}},
+        "stats_column": {...},
         "total_spins":  N
       }
-    Estos datos se usan en _get_ph() para el análisis de predicciones de señales.
     """
     def __init__(self):
         self.stats_dozen  = {}
@@ -206,9 +260,7 @@ class StatsClient:
 
     def get_ph_from_stats(self, number: int, cat_type: str) -> Optional[Dict]:
         """
-        Obtiene probabilidades históricas (PH) desde el servidor Render.
-        Busca qué par de docenas/columnas aparece más seguido después del número dado.
-        Adapta la misma lógica de v26 al nuevo servidor HTTP.
+        PH clásico: retorna el par más frecuente post-número desde el servidor.
         """
         stats   = self.stats_column if cat_type == "COLUMNA" else self.stats_dozen
         num_key = str(number)
@@ -225,6 +277,24 @@ class StatsClient:
         missing = list({1, 2, 3} - set(pair))[0]
         prob    = (sorted_probs[0][1] + sorted_probs[1][1]) / 100.0
         return {"pair": pair, "missing": missing, "prob": prob}
+
+    def get_ph_probs_raw(self, number: int, cat_type: str) -> Optional[Dict]:
+        """
+        Retorna probabilidades individuales de las 3 docenas/columnas (en rango 0-1)
+        desde el servidor Render.  Usado para construir PHF.
+        """
+        stats   = self.stats_column if cat_type == "COLUMNA" else self.stats_dozen
+        num_key = str(number)
+        if num_key not in stats:
+            return None
+        data = stats[num_key]
+        if data.get("total", 0) < 10:
+            return None
+        return {
+            1: data.get("1", 0) / 100.0,
+            2: data.get("2", 0) / 100.0,
+            3: data.get("3", 0) / 100.0,
+        }
 
 # ─── EMA ──────────────────────────────────────────────────────────────────────
 def calc_ema(data, period):
@@ -347,7 +417,6 @@ class GestorDocenas:
         self.oportunidad = 1
 
     def get_target(self):
-        # La ganancia neta de un ciclo completo al descontar la apuesta del cero (10%)
         net_base = BASE_BET * 0.9
         return (self.debt_stack[-1] + net_base) if self.debt_stack else (self.b0 + net_base)
 
@@ -355,10 +424,9 @@ class GestorDocenas:
         return self.nivel * BASE_BET if self.oportunidad == 1 else 3 * self.nivel * BASE_BET
 
     def registrar_perdida_senal(self):
-        """Se llama SOLO cuando fallan AMBAS oportunidades (igual que v26)."""
         self.debt_stack.append(self.b0)
         self.nivel = self.nivel + 1 if self.nivel < MAX_NIVEL else 1
-        logger.info(f"[Speed2DC] 📋 Deuda: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} | Nivel→{self.nivel}")
+        logger.info(f"[RussianDC] 📋 Deuda: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} | Nivel→{self.nivel}")
 
     def verificar_recuperacion(self, balance):
         while self.debt_stack:
@@ -371,15 +439,6 @@ class GestorDocenas:
 
 # ─── STATS ────────────────────────────────────────────────────────────────────
 class DetailedStats:
-    """
-    Registra el RESULTADO FINAL de cada señal global (igual a v26):
-      - WIN_PAR  : gana la docena/columna en 1ra o 2da oportunidad
-      - WIN_ZERO : gana el cero en 1ra o 2da oportunidad
-      - LOSS     : pierden AMBAS oportunidades
-
-    La 1ra oportunidad perdida NO se registra aquí (sólo genera waiting_second_opp).
-    Cada entrada en last_20 muestra en qué oportunidad fue el resultado final.
-    """
     def __init__(self):
         self.wins_pair           = 0
         self.wins_zero           = 0
@@ -390,10 +449,6 @@ class DetailedStats:
         self.last_report_signals = 0
 
     def record(self, result_type, oportunidad, number, val, type_str, bankroll):
-        """
-        result_type : 'WIN_PAR' | 'WIN_ZERO' | 'LOSS'
-        oportunidad : 1 = primera señal  |  2 = segunda oportunidad
-        """
         self.signals_processed += 1
         if result_type == 'WIN_PAR':
             self.wins_pair   += 1
@@ -439,7 +494,7 @@ class DetailedStats:
         return text
 
 # ─── ENGINE ───────────────────────────────────────────────────────────────────
-class Speed2RouletteEngine:
+class RussianRouletteEngine:
     def __init__(self, stats_client: StatsClient):
         self.stats_client         = stats_client
         self.spin_history         = []
@@ -454,23 +509,18 @@ class Speed2RouletteEngine:
         self.after_number_dozen   = defaultdict(lambda: defaultdict(int))
         self.after_number_column  = defaultdict(lambda: defaultdict(int))
 
-        # ── Estado señal ──────────────────────────────────────────────────────
         self.signal_active        = False
         self.active_type          = None
         self.active_pair          = ()
         self.active_missing       = ""
         self.gestor               = GestorDocenas()
-        self.total_signal_loss    = 0.0   # acumula pérdidas de AMBAS oportunidades
+        self.total_signal_loss    = 0.0
         self.active_signal_msg_id = None
 
-        # ── Estado 2da oportunidad ────────────────────────────────────────────
-        # waiting_second_opp: True cuando se perdió la 1ra señal y
-        # se espera que el modelo detecte una NUEVA señal natural ≥80%
         self.waiting_second_opp   = False
-        self.analyzing_msg_id     = None   # ID del mensaje "🚨 ANALIZANDO 2°..."
+        self.analyzing_msg_id     = None
 
-        # ── Resto ─────────────────────────────────────────────────────────────
-        self.bankroll             = 100.0  # BANKROLL INICIAL (USD)
+        self.bankroll             = 100.0
         self.stats                = DetailedStats()
         self._db                  = _get_db()
         self.spins_since_train    = 0
@@ -480,7 +530,7 @@ class Speed2RouletteEngine:
         live_loaded      = self._load_live_history()
         self.ws_count    = live_loaded
         self.warmup_done = live_loaded >= WARMUP_SPINS
-        logger.info(f"[Speed2DC] 📦 Pre-cargados: {live_loaded} | Warmup: {'✅' if self.warmup_done else '⏳'}")
+        logger.info(f"[RussianDC] 📦 Pre-cargados: {live_loaded} | Warmup: {'✅' if self.warmup_done else '⏳'}")
 
     # ── DB ────────────────────────────────────────────────────────────────────
     def _load_live_history(self):
@@ -541,11 +591,8 @@ class Speed2RouletteEngine:
         if persist:
             self._persist(number)
 
+    # ── PF — Frecuencia reciente ──────────────────────────────────────────────
     def _get_pf(self, cat_type):
-        """
-        PF — Frecuencia reciente (últimos 5 giros).
-        Igual lógica que v26, adaptada al engine v27.
-        """
         if len(self.spin_history) < 5: return None
         counts = {1: 0, 2: 0, 3: 0}
         for s in self.spin_history[-5:]:
@@ -559,20 +606,15 @@ class Speed2RouletteEngine:
                 "missing": list({1, 2, 3} - set(active))[0],
                 "prob": sum(counts[a] for a in active) / 5.0}
 
+    # ── PH — Histórico post-número (par clásico) ──────────────────────────────
     def _get_ph(self, cat_type):
-        """
-        PH — Histórico post-número.
-        Primero consulta el servidor Render (stats del nuevo servidor HTTP),
-        si no hay datos suficientes usa histórico local.
-        Misma lógica que v26 pero adaptada al nuevo servidor.
-        """
         if not self.spin_history: return None
         last_num = self.spin_history[-1]["number"]
         if last_num == 0: return None
-        # 1) Intenta obtener PH desde el nuevo servidor HTTP (Render)
+        # 1) Servidor Render
         server_ph = self.stats_client.get_ph_from_stats(last_num, cat_type)
         if server_ph: return server_ph
-        # 2) Fallback: histórico local (igual que v26)
+        # 2) Fallback local
         counts = (self.after_number_dozen.get(last_num, {})
                   if cat_type == "DOCENA"
                   else self.after_number_column.get(last_num, {}))
@@ -584,11 +626,100 @@ class Speed2RouletteEngine:
                 "missing": list({1, 2, 3} - {sc[0][0], sc[1][0]})[0],
                 "prob": (sc[0][1] + sc[1][1]) / total}
 
+    # ── PHTML — Probabilidades fijas de la tabla HTML ─────────────────────────
+    def _get_phtml_probs(self, number: int) -> Optional[Dict]:
+        """
+        Retorna las probabilidades predefinidas de la tabla HTML (PHTML)
+        para el número dado, normalizadas como fracciones {1: p1, 2: p2, 3: p3}.
+        Retorna None para el número 0 (NO APOSTAR).
+        """
+        if number == 0:
+            return None
+        entry = DOZEN_TABLE.get(number)
+        if entry is None:
+            return None
+        d1, d2, d3 = entry["d1"], entry["d2"], entry["d3"]
+        total = d1 + d2 + d3
+        if total == 0:
+            return None
+        return {1: d1 / total, 2: d2 / total, 3: d3 / total}
+
+    # ── PH Probs Raw — Probabilidades individuales del servidor ───────────────
+    def _get_ph_probs_raw(self, number: int, cat_type: str) -> Optional[Dict]:
+        """
+        Retorna probabilidades individuales de las 3 docenas desde el servidor
+        (en rango 0-1).  Usado internamente para construir PHF.
+        Fallback a histórico local si no hay suficientes datos del servidor.
+        """
+        if number == 0:
+            return None
+        # 1) Servidor Render
+        probs = self.stats_client.get_ph_probs_raw(number, cat_type)
+        if probs is not None:
+            return probs
+        # 2) Fallback local
+        counts = (self.after_number_dozen.get(number, {})
+                  if cat_type == "DOCENA"
+                  else self.after_number_column.get(number, {}))
+        total = sum(counts.values())
+        if total < 10:
+            return None
+        return {1: counts.get(1, 0) / total,
+                2: counts.get(2, 0) / total,
+                3: counts.get(3, 0) / total}
+
+    # ── PHF — Probabilidad combinada PHTML(65%) + PH(35%) ────────────────────
+    def _get_phf(self, number: int) -> Optional[Dict]:
+        """
+        PHF = PHTML(65%) + PH(35%) ponderado para DOCENA.
+
+        1. Obtiene PHTML (probabilidades fijas de la tabla HTML) para el número.
+        2. Obtiene PH (probabilidades históricas del servidor/local).
+        3. Combina: PHF[d] = PHTML_W * PHTML[d] + PH_W_COMBINE * PH[d]
+        4. Normaliza y determina el par de docenas con mayor probabilidad.
+        5. Retorna {"pair", "missing", "prob", "probs"}.
+
+        Si no hay datos PH, usa solo PHTML.
+        Retorna None si no hay PHTML disponible (número 0 o sin datos).
+        """
+        if number == 0:
+            return None
+
+        phtml = self._get_phtml_probs(number)
+        if phtml is None:
+            return None
+
+        ph = self._get_ph_probs_raw(number, "DOCENA")
+
+        if ph is not None:
+            # Blend ponderado
+            phf_raw = {d: PHTML_W * phtml[d] + PH_W_COMBINE * ph[d] for d in [1, 2, 3]}
+        else:
+            # Sin datos PH: usar solo PHTML
+            logger.debug(f"[RussianDC] PHF: sin PH para #{number}, usando solo PHTML")
+            phf_raw = phtml.copy()
+
+        # Normalizar
+        total = sum(phf_raw.values())
+        if total == 0:
+            return None
+        phf = {d: v / total for d, v in phf_raw.items()}
+
+        # Obtener top 2 docenas por PHF
+        sorted_d = sorted(phf.items(), key=lambda x: x[1], reverse=True)
+        pair     = tuple(sorted([sorted_d[0][0], sorted_d[1][0]]))
+        missing  = list({1, 2, 3} - set(pair))[0]
+        prob     = phf[sorted_d[0][0]] + phf[sorted_d[1][0]]
+
+        logger.debug(
+            f"[RussianDC] PHF #{number}: "
+            f"D1={phf[1]:.1%} D2={phf[2]:.1%} D3={phf[3]:.1%} "
+            f"→ par={pair} prob={prob:.0%}"
+        )
+        return {"pair": pair, "missing": missing, "prob": prob, "probs": phf}
+
+    # ── ML — Predicción combinada Markov + Ensemble ───────────────────────────
     def _predict_pair_ml(self, cat_type, missing_num):
-        """
-        ML — Predicción combinada Markov + Ensemble.
-        Misma lógica que v26, adaptada al engine v27.
-        """
         mk     = self.markov_d if cat_type == "DOCENA" else self.markov_c
         hist   = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
         levels = (self.d_levels if cat_type == "DOCENA" else self.c_levels).get(missing_num, [])
@@ -610,46 +741,73 @@ class Speed2RouletteEngine:
             elif ema_signal(levels, "moderado"): ml_miss *= 0.92
         return 1.0 - ml_miss
 
-    # ── Detección de señal (igual a v26, adaptada al engine v27) ─────────────
+    # ── Detección de señal con PHF ────────────────────────────────────────────
     def _detect_signal(self):
         """
         Detecta señal con probabilidad ≥ MIN_PROB (80%).
-        Combina PF + PH + ML igual que v26.
-        Se usa tanto para señal normal (1ra oportunidad) como para la 2da.
-        Adaptado al nuevo servidor HTTP (PH usa stats del servidor Render).
+
+        DOCENA  → usa PHF = PHTML(65%) + PH(35%)
+          • Si PHF par == PF par → analiza señal con PF + PHF + ML
+        COLUMNA → usa PH directo (sin PHTML, la tabla solo tiene docenas)
+          • Si PH par == PF par → analiza señal con PF + PH + ML
         """
         pf_d = self._get_pf("DOCENA")
         pf_c = self._get_pf("COLUMNA")
-        if not pf_d and not pf_c: return None
-        ph_d = self._get_ph("DOCENA")
-        ph_c = self._get_ph("COLUMNA")
+        if not pf_d and not pf_c:
+            return None
+
+        last_num = self.spin_history[-1]["number"] if self.spin_history else None
+        if last_num is None:
+            return None
+
         candidates = []
-        if pf_d and ph_d and set(pf_d["pair"]) == set(ph_d["pair"]):
-            base = PF_W_NORM * pf_d["prob"] + PH_W_NORM * ph_d["prob"]
-            ml   = self._predict_pair_ml("DOCENA", pf_d["missing"])
-            prob = BASE_W_NORM * base + ML_W_NORM * ml
-            logger.info(f"[Speed2DC] D base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
-            if prob >= MIN_PROB:
-                candidates.append({"type": "DOCENA",
-                                    "pair": tuple(f"D{x}" for x in sorted(pf_d["pair"])),
-                                    "missing": f"D{pf_d['missing']}", "prob": prob})
+
+        # ── DOCENA: PHF = PHTML(65%) + PH(35%) ───────────────────────────────
+        if pf_d and last_num != 0:
+            phf_d = self._get_phf(last_num)
+            if phf_d and set(pf_d["pair"]) == set(phf_d["pair"]):
+                # PF par coincide con PHF par → analizar señal
+                base = PF_W_NORM * pf_d["prob"] + PH_W_NORM * phf_d["prob"]
+                ml   = self._predict_pair_ml("DOCENA", pf_d["missing"])
+                prob = BASE_W_NORM * base + ML_W_NORM * ml
+                logger.info(
+                    f"[RussianDC] D | PF:{pf_d['prob']:.0%} "
+                    f"PHF:{phf_d['prob']:.0%} "
+                    f"(PHTML:{phf_d['probs'][1]:.1%}/{phf_d['probs'][2]:.1%}/{phf_d['probs'][3]:.1%}) "
+                    f"base:{base:.0%} ml:{ml:.0%} → final:{prob:.0%}"
+                )
+                if prob >= MIN_PROB:
+                    candidates.append({
+                        "type": "DOCENA",
+                        "pair": tuple(f"D{x}" for x in sorted(pf_d["pair"])),
+                        "missing": f"D{pf_d['missing']}",
+                        "prob": prob
+                    })
+            else:
+                if phf_d:
+                    logger.debug(
+                        f"[RussianDC] D | PF par {pf_d['pair']} ≠ PHF par {phf_d['pair']} → sin señal"
+                    )
+
+        # ── COLUMNA: PH directo (tabla HTML no cubre columnas) ────────────────
+        ph_c = self._get_ph("COLUMNA")
         if pf_c and ph_c and set(pf_c["pair"]) == set(ph_c["pair"]):
             base = PF_W_NORM * pf_c["prob"] + PH_W_NORM * ph_c["prob"]
             ml   = self._predict_pair_ml("COLUMNA", pf_c["missing"])
             prob = BASE_W_NORM * base + ML_W_NORM * ml
-            logger.info(f"[Speed2DC] C base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
+            logger.info(f"[RussianDC] C | PF:{pf_c['prob']:.0%} PH:{ph_c['prob']:.0%} base:{base:.0%} ml:{ml:.0%} → final:{prob:.0%}")
             if prob >= MIN_PROB:
-                candidates.append({"type": "COLUMNA",
-                                    "pair": tuple(f"C{x}" for x in sorted(pf_c["pair"])),
-                                    "missing": f"C{pf_c['missing']}", "prob": prob})
+                candidates.append({
+                    "type": "COLUMNA",
+                    "pair": tuple(f"C{x}" for x in sorted(pf_c["pair"])),
+                    "missing": f"C{pf_c['missing']}",
+                    "prob": prob
+                })
+
         return max(candidates, key=lambda x: x["prob"]) if candidates else None
 
     # ── Formato de señal ──────────────────────────────────────────────────────
     def _format_bets(self, bet_usd, type_str):
-        """
-        Muestra apuesta por país con el cero incluido (10% de la apuesta).
-        Correcto: apuesta D/C + apuesta cero (10%) separadas.
-        """
         lines = []
         for curr in ["USD", "MXN", "PEN", "COP", "ARS", "CLP"]:
             sym      = CURRENCY_SYMBOLS[curr]
@@ -675,58 +833,42 @@ class Speed2RouletteEngine:
                       if self.gestor.oportunidad == 1
                       else "🚨 SEGUNDA OPORTUNIDAD 🚨")
         return (f"{header}\n\n"
-                f"🕹️ SPEED ROULETTE 2\n"
+                f"🕹️ RUSSIAN ROULETTE\n"
                 f"🎯 {cat_label}: {pair_disp}\n"
                 f"⚔️ Cubrir el CERO 🟢\n\n"
                 f"🚨 MONTO DE APUESTA POR PAIS:\n"
                 f"{self._format_bets(bet_usd, bet_label)}")
 
     def _send_signal(self):
-        msg_id = tg_send(self._build_signal_text())
+        msg_id = tg_send(self._build_signal_text(), markup=russian_keyboard())
         if msg_id:
             self.active_signal_msg_id = msg_id
 
     # ── Resolución ────────────────────────────────────────────────────────────
     def _resolve(self, number, color):
-        """
-        Resuelve el giro activo considerando la apuesta al cero (10% de la ficha).
-
-        Lógica financiera (igual que v26):
-          spin_investment = (2 × bet_usd) + zero_bet
-          WIN D/C  : dozen_payout (3×bet) - spin_investment  → net = bet - zero_bet
-          WIN CERO : zero_payout (36×zero_bet) - spin_investment
-          LOSS     : -spin_investment
-
-        Stats: se registra solo el resultado FINAL del ciclo completo (igual a v26).
-          - 1ra oportunidad perdida → NO se registra, se activa waiting_second_opp
-          - nivel/debt solo sube cuando fallan AMBAS oportunidades
-        """
         d        = get_dozen(number)
         c        = get_column(number)
         type_str = self.active_type
         val_num  = d if type_str == "DOCENA" else c
-        opp_num  = self.gestor.oportunidad     # 1 = primera, 2 = segunda
+        opp_num  = self.gestor.oportunidad
         val_prefix  = "D" if type_str == "DOCENA" else "C"
         val_display = f"{val_prefix}{val_num}"
         bet_usd  = self.gestor.apostar_por_docena(self.bankroll)
 
-        # Apuesta al cero: 10% de la ficha (igual que v26)
-        zero_bet       = round(0.1 * bet_usd, 2)
+        zero_bet        = round(0.1 * bet_usd, 2)
         spin_investment = round((2 * bet_usd) + zero_bet, 2)
 
-        # ── ZERO ──────────────────────────────────────────────────────────────
         if number == 0:
-            # Gana el cero (36x la ficha del cero), se pierden las 2 apuestas D/C
             zero_payout  = round(zero_bet * 36, 2)
             spin_profit  = round(zero_payout - spin_investment, 2)
             self.bankroll = round(self.bankroll + spin_profit, 2)
             signal_profit = round(spin_profit - self.total_signal_loss, 2)
-
             self.gestor.verificar_recuperacion(self.bankroll)
             sign = "+" if signal_profit >= 0 else ""
             tg_send(f"🟢 CERO — Ganó el cero — Op. #{opp_num}\n"
                     f"🎉 {sign}{signal_profit:.2f} USD 🎉\n"
-                    f"💰 Balance: ${self.bankroll:.2f} USD")
+                    f"💰 Balance: ${self.bankroll:.2f} USD",
+                    markup=russian_keyboard())
             self.stats.record('WIN_ZERO', opp_num, 0, 0, type_str, self.bankroll)
             self._check_stats()
             self._reset_signal()
@@ -736,55 +878,44 @@ class Speed2RouletteEngine:
                (type_str == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair))
 
         if won:
-            # ── WIN D/C: paga 3× la ficha, se descuenta la apuesta del cero
             dozen_payout  = round(3 * bet_usd, 2)
-            spin_profit   = round(dozen_payout - spin_investment, 2)  # = bet_usd - zero_bet
+            spin_profit   = round(dozen_payout - spin_investment, 2)
             self.bankroll = round(self.bankroll + spin_profit, 2)
             signal_profit = round(spin_profit - self.total_signal_loss, 2)
-
             self.gestor.verificar_recuperacion(self.bankroll)
             sign = "+" if signal_profit >= 0 else ""
             tg_send(f"✅ WIN {number} — {type_str} {val_display} — Op. #{opp_num}\n"
                     f"🎉 {sign}{signal_profit:.2f} USD 🎉\n"
-                    f"💰 Balance: ${self.bankroll:.2f} USD")
+                    f"💰 Balance: ${self.bankroll:.2f} USD",
+                    markup=russian_keyboard())
             self.stats.record('WIN_PAR', opp_num, number, val_num, type_str, self.bankroll)
             self._check_stats()
             self._reset_signal()
 
         else:
-            # ── LOSS: se pierde la inversión completa (D/C × 2 + cero)
             self.bankroll          = round(self.bankroll - spin_investment, 2)
             self.total_signal_loss = round(self.total_signal_loss + spin_investment, 2)
 
             if opp_num == 1:
-                # ── 1ra señal perdida: borrar mensaje, esperar 2da oportunidad
-                # NO se registra en stats (igual a v26 donde gale#0 no se contaba)
-                # NO se sube de nivel (igual a v26)
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
-
-                self._reset_signal()   # limpia estado de señal
-
-                # Enviar mensaje de análisis y activar modo espera
+                self._reset_signal()
                 msg_id = tg_send("🚨 ANALIZANDO 2° OPORTUNIDAD 🚨")
                 self.analyzing_msg_id   = msg_id
                 self.waiting_second_opp = True
-                logger.info("[Speed2DC] ⏳ Esperando 2da oportunidad (nueva señal ≥80%)...")
-
+                logger.info("[RussianDC] ⏳ Esperando 2da oportunidad (nueva señal ≥80%)...")
             else:
-                # ── 2da oportunidad perdida: LOSS final del ciclo completo
-                # Ahora sí se registra en stats y se sube de nivel (igual a v26 gale#1)
                 tg_send(f"❌ LOSS {number} — {type_str} {val_display}\n"
                         f"🚨 -{self.total_signal_loss:.2f} USD 🚨\n"
-                        f"💰 Balance: ${self.bankroll:.2f} USD")
+                        f"💰 Balance: ${self.bankroll:.2f} USD",
+                        markup=russian_keyboard())
                 self.stats.record('LOSS', opp_num, number, val_num, type_str, self.bankroll)
                 self.gestor.registrar_perdida_senal()
                 self._check_stats()
                 self._reset_signal()
 
     def _reset_signal(self):
-        """Resetea completamente el estado de señal y 2da oportunidad."""
         self.signal_active        = False
         self.active_pair          = ()
         self.active_type          = None
@@ -800,11 +931,6 @@ class Speed2RouletteEngine:
 
     # ── Loop principal ────────────────────────────────────────────────────────
     def process_batch(self, batch):
-        """
-        Procesa los giros recibidos desde el nuevo servidor HTTP (Render).
-        Formato esperado: [{"game_id": "...", "number": N}, ...]
-        Igual deduplicación que v27 original, adaptada al formato del nuevo servidor.
-        """
         new_spins = []
         for spin in reversed(batch):
             gid = spin.get("game_id")
@@ -828,42 +954,34 @@ class Speed2RouletteEngine:
     def _process_inner(self, number):
         d = get_dozen(number)
         c = get_column(number)
-        logger.info(f"[Speed2DC] 🎰 #{len(self.spin_history)+1}: {number} D{d} C{c}")
+        logger.info(f"[RussianDC] 🎰 #{len(self.spin_history)+1}: {number} D{d} C{c}")
         self._update_state(number)
 
         if not self.warmup_done:
             self.ws_count += 1
             if self.ws_count < WARMUP_SPINS: return
             self.warmup_done = True
-            tg_send("🟢 <b>Speed Roulette 2 DC</b> — Listo.")
+            tg_send("🟢 <b>Russian Roulette DC</b> — Listo. (PHF activo)")
 
         if self.signal_active:
-            # Hay señal activa → resolver el giro
             self._resolve(number, REAL_COLOR_MAP.get(number, "VERDE"))
-
         else:
-            # No hay señal activa → intentar detectar una nueva señal ≥80%
             sig = self._detect_signal()
             if sig:
                 if self.waiting_second_opp:
-                    # ── Confirmar como 2da oportunidad ───────────────────────
                     if self.analyzing_msg_id:
                         tg_delete(CHAT_ID, self.analyzing_msg_id)
                         self.analyzing_msg_id = None
                     self.waiting_second_opp   = False
-
                     self.signal_active        = True
                     self.active_type          = sig["type"]
                     self.active_pair          = sig["pair"]
                     self.active_missing       = sig["missing"]
                     self.gestor.iniciar_senal(self.bankroll)
-                    self.gestor.oportunidad   = 2          # ← segunda oportunidad
-                    # total_signal_loss ya acumuló la pérdida de la 1ra oportunidad
+                    self.gestor.oportunidad   = 2
                     self._send_signal()
-                    logger.info(f"[Speed2DC] 🎯 2DA OPP {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
-
+                    logger.info(f"[RussianDC] 🎯 2DA OPP {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
                 else:
-                    # ── Señal nueva normal (1ra oportunidad) ─────────────────
                     self.signal_active        = True
                     self.active_type          = sig["type"]
                     self.active_pair          = sig["pair"]
@@ -871,17 +989,16 @@ class Speed2RouletteEngine:
                     self.gestor.iniciar_senal(self.bankroll)
                     self.total_signal_loss    = 0.0
                     self._send_signal()
-                    logger.info(f"[Speed2DC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
+                    logger.info(f"[RussianDC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
-    # ── HTTP Polling al nuevo servidor Render ─────────────────────────────────
+    # ── HTTP Polling al servidor Render ───────────────────────────────────────
     async def poll_loop(self):
         """
-        Polling HTTP cada 1s al endpoint del nuevo servidor Render.
-        Endpoint: GET /latest/SPEED2
-        Respuesta: { last_20: [{game_id, number},...], stats_dozen, stats_column, total_spins }
+        Polling HTTP cada 1s → GET /latest/RUSSIAN
+        Respuesta: {last_20, stats_dozen, stats_column, total_spins}
         """
         url = f"{STATS_URL}/latest/{TARGET_ROULETTE}"
-        logger.info(f"[Speed2DC] 🔄 Iniciando polling cada {POLL_INTERVAL}s → {url}")
+        logger.info(f"[RussianDC] 🔄 Iniciando polling cada {POLL_INTERVAL}s → {url}")
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
@@ -894,19 +1011,19 @@ class Speed2RouletteEngine:
                                 self.process_batch(last_20)
                         else:
                             self.stats_client.connected = False
-                            logger.warning(f"[Speed2DC] ⚠️ Poll status: {resp.status}")
+                            logger.warning(f"[RussianDC] ⚠️ Poll status: {resp.status}")
                 except Exception as e:
                     self.stats_client.connected = False
-                    logger.debug(f"[Speed2DC] Poll error: {e}")
+                    logger.debug(f"[RussianDC] Poll error: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
 
 # ─── FLASK ────────────────────────────────────────────────────────────────────
 app    = Flask(__name__)
-engine: Optional[Speed2RouletteEngine] = None
+engine: Optional[RussianRouletteEngine] = None
 
 @app.route("/")
 def home():
-    return jsonify({"status": "ok", "bot": "Speed 2 DC", "mode": "HTTP polling"})
+    return jsonify({"status": "ok", "bot": "Russian Roulette DC", "mode": "HTTP polling + PHF"})
 
 @app.route("/ping")
 def ping():
@@ -926,6 +1043,9 @@ def health():
         "waiting_2nd_opp": engine.waiting_second_opp,
         "nivel":           engine.gestor.nivel,
         "debt_count":      len(engine.gestor.debt_stack),
+        "phf_active":      True,
+        "phtml_w":         PHTML_W,
+        "ph_w_combine":    PH_W_COMBINE,
     })
 
 async def self_ping_loop():
@@ -939,14 +1059,16 @@ async def self_ping_loop():
             pass
         await asyncio.sleep(240)
 
+# ─── COMANDOS TELEGRAM ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
     bot.reply_to(m,
-        "<b>🎰 Speed Roulette 2 DC</b>\n\n"
+        "<b>🎰 Russian Roulette DC</b>\n\n"
         "Polling HTTP cada 1s | Umbral 80%\n"
+        "PHF = PHTML(65%) + PH(35%)\n"
         "Apuesta: 0.50 USD + Cero 10% (0.05 USD)\n"
         "2 oportunidades por señal global\n\n"
-        "/status /stats /reset",
+        "/status /stats /reset /phf",
         parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
@@ -972,7 +1094,34 @@ def cmd_status(m):
         f"<b>Deudas:</b> {len(engine.gestor.debt_stack)}\n"
         f"<b>Servidor:</b> {conn} ({engine.stats_client.poll_count} polls, "
         f"último hace {ago:.0f}s)\n"
-        f"<b>IDs procesados:</b> {len(engine.processed_game_ids)}",
+        f"<b>PHF:</b> PHTML {PHTML_W:.0%} + PH {PH_W_COMBINE:.0%}",
+        parse_mode="HTML")
+
+@bot.message_handler(commands=['phf'])
+def cmd_phf(m):
+    """Muestra el PHF del último número procesado."""
+    if not engine or not engine.spin_history:
+        bot.reply_to(m, "❌ Sin giros procesados aún", parse_mode="HTML")
+        return
+    last = engine.spin_history[-1]["number"]
+    phtml = engine._get_phtml_probs(last)
+    ph    = engine._get_ph_probs_raw(last, "DOCENA")
+    phf   = engine._get_phf(last)
+    pf    = engine._get_pf("DOCENA")
+
+    def fmt(d): return f"D1:{d[1]:.1%} D2:{d[2]:.1%} D3:{d[3]:.1%}" if d else "N/A"
+
+    coincide = "✅ SÍ" if (pf and phf and set(pf["pair"]) == set(phf["pair"])) else "❌ NO"
+
+    bot.reply_to(m,
+        f"<b>🔬 PHF para #{last}</b>\n\n"
+        f"<b>PHTML ({PHTML_W:.0%}):</b> {fmt(phtml)}\n"
+        f"<b>PH ({PH_W_COMBINE:.0%}):</b> {fmt(ph)}\n"
+        f"<b>PHF:</b> {fmt(phf['probs']) if phf else 'N/A'}\n"
+        f"  → par={phf['pair']} prob={phf['prob']:.0%}\n\n"
+        f"<b>PF par:</b> {pf['pair'] if pf else 'N/A'}\n"
+        f"<b>PHF par:</b> {phf['pair'] if phf else 'N/A'}\n"
+        f"<b>Coinciden:</b> {coincide}",
         parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
@@ -995,18 +1144,22 @@ def cmd_reset(m):
                  parse_mode="HTML")
 
 def run_flask():
-    app.run(host="0.0.0.0", port=10003, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=10005, debug=False, use_reloader=False)
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
     global engine
     stats_client = StatsClient()
-    engine       = Speed2RouletteEngine(stats_client)
+    engine       = RussianRouletteEngine(stats_client)
     threading.Thread(
         target=lambda: bot.polling(none_stop=True, interval=1, timeout=30),
         daemon=True
     ).start()
-    logger.info("[Speed2DC] 🎰 Bot Speed 2 — HTTP Polling cada 1s | Umbral 80% | Cero 10%")
+    logger.info(
+        f"[RussianDC] 🎰 Russian Roulette DC — "
+        f"HTTP Polling 1s | Umbral {MIN_PROB:.0%} | "
+        f"PHF=PHTML({PHTML_W:.0%})+PH({PH_W_COMBINE:.0%}) | Cero 10%"
+    )
     await asyncio.gather(
         asyncio.create_task(engine.poll_loop()),
         asyncio.create_task(self_ping_loop())
