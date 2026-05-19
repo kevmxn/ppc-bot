@@ -78,19 +78,19 @@ TARGET_ROULETTE = "RUSSIAN"           # ← Ruleta Rusa (key=221 en el servidor)
 POLL_INTERVAL   = 1                   # segundos
 LIVE_DB         = "russian_live.db"   # DB local específica de Russian
 
-BASE_BET        = 0.50
+BASE_BET        = 1.00
 MAX_NIVEL       = 6
 WARMUP_SPINS    = 25
-MIN_PROB        = 0.80
+MIN_PROB        = 0.78
 TRAIN_INTERVAL  = 100
 
 # Pesos para PHF = PHTML(65%) + PH(35%)
-PHTML_W         = 0.65    # peso de la tabla HTML predefinida
-PH_W_COMBINE    = 0.35    # peso del histórico del servidor
+PHTML_W         = 0.80    # peso de la tabla HTML predefinida
+PH_W_COMBINE    = 0.20    # peso del histórico del servidor
 
 # Pesos del cálculo de señal
-PF_W_NORM   = 0.65; PH_W_NORM   = 0.35   # PF vs PHF en base
-BASE_W_NORM = 0.50; ML_W_NORM   = 0.50   # base vs ML en prob final
+PF_W_NORM   = 0.70; PH_W_NORM   = 0.30   # PF vs PHF en base
+BASE_W_NORM = 0.55; ML_W_NORM   = 0.45   # base vs ML en prob final
 PF_W_GALE1  = 0.30; PH_W_GALE1  = 0.70
 BASE_W_GALE1= 0.65; ML_W_GALE1  = 0.35
 MIN_PROB_GALE1 = 0.70
