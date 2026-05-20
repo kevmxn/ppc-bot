@@ -89,15 +89,15 @@ POLL_INTERVAL   = 1
 LIVE_DB         = "speedroulette1_live.db"
 
 BASE_BET        = 0.10      # USD — ficha base (v29)
-MAX_NIVEL       = 6
+MAX_NIVEL       = 10
 WARMUP_SPINS    = 25
 MIN_PROB        = 0.78      # umbral base E1 y E3
 MAX_INTENTOS    = 3
 TRAIN_INTERVAL  = 100
 
-# Pesos PHF = PHTML(80%) + PH(20%)
-PHTML_W         = 0.80
-PH_W_COMBINE    = 0.20
+# Pesos PHF = PHTML(60%) + PH(40%)
+PHTML_W         = 0.60
+PH_W_COMBINE    = 0.40
 
 # Pesos señal E1
 PF_W_NORM  = 0.70; PH_W_NORM  = 0.30
