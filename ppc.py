@@ -84,7 +84,7 @@ except Exception as e:
 
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 STATS_URL       = "https://ruletasbot-rjce.onrender.com"
-TARGET_ROULETTE = "203"
+TARGET_ROULETTE = "SPEED1"
 POLL_INTERVAL   = 1
 LIVE_DB         = "speedroulette1_live.db"
 
