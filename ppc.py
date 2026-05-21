@@ -59,10 +59,13 @@ CHAT_ID = -1003630680656
 # ─── URL RULETA ───────────────────────────────────────────────────────────────
 SPEEDROULETTE1_URL = "https://1win.lat/casino/play/v_pragmatic:speedroulette1"
 
-def speed_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("👆🏻 ACCEDER a SPEED ROULETTE 1", url=SPEEDROULETTE1_URL))
-    return kb
+SPEED_LINKS = (
+    '<a href="https://melbet-ar3.com/es/casino-search?game=69606">🟡 Melbet</a> '
+    '<a href="https://betwinner-06870.pro/mx/casino-search?game=69606">🟢 Betwinner</a>\n'
+    '<a href="https://play-888starz.com/es/casino-search?game=69606">🔴 888Starz</a> '
+    '<a href="https://1xbetarge.com/es/casino-search?game=49230">⚪ 1xbet</a> '
+    '<a href="https://1win.lat/casino/play/v_pragmatic:speedroulette1">🔵 1win</a>'
+)
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 _session = requests.Session()
@@ -89,15 +92,15 @@ POLL_INTERVAL   = 1
 LIVE_DB         = "speedroulette1_live.db"
 
 BASE_BET        = 0.10      # USD — ficha base (v29)
-MAX_NIVEL       = 10
+MAX_NIVEL       = 3
 WARMUP_SPINS    = 25
 MIN_PROB        = 0.78      # umbral base E1 y E3
-MAX_INTENTOS    = 3
+MAX_INTENTOS    = 2
 TRAIN_INTERVAL  = 100
 
 # Pesos PHF = PHTML(60%) + PH(40%)
-PHTML_W         = 0.60
-PH_W_COMBINE    = 0.40
+PHTML_W         = 0.55
+PH_W_COMBINE    = 0.45
 
 # Pesos señal E1
 PF_W_NORM  = 0.70; PH_W_NORM  = 0.30
@@ -427,9 +430,12 @@ class OnlineEnsemblePredictor:
 # ─── GESTOR DE FICHAS Y NIVELES ───────────────────────────────────────────────
 class GestorDocenas:
     """
-    Intento 1  → nivel × BASE_BET
-    Intentos 2-3 → 3 × nivel × BASE_BET
-    nivel sube al perder todos los intentos; baja a 1 al recuperar (debt_stack).
+    Niveles de apuesta (3 niveles, 2 intentos):
+      Nivel 1: Int.1 = $0.10 | Int.2 = $0.30
+      Nivel 2: Int.1 = $0.90 | Int.2 = $2.70
+      Nivel 3: Int.1 = $8.10 | Int.2 = $24.30
+    Fórmula: Int.1 = BASE_BET × 9^(nivel-1) | Int.2 = 3 × BASE_BET × 9^(nivel-1)
+    nivel sube (1→3) al perder los intentos; baja a 1 al recuperar (debt_stack).
     """
     def __init__(self):
         self.nivel      = 1
@@ -440,9 +446,10 @@ class GestorDocenas:
         self.b0 = balance
 
     def get_bet(self, intento: int = 1) -> float:
+        multiplier = 9 ** (self.nivel - 1)
         if intento == 1:
-            return self.nivel * BASE_BET
-        return 3 * self.nivel * BASE_BET
+            return round(BASE_BET * multiplier, 2)
+        return round(3 * BASE_BET * multiplier, 2)
 
     def registrar_perdida_senal(self):
         self.debt_stack.append(self.b0)
@@ -1266,8 +1273,7 @@ class SpeedRouletteEngine:
 
     def _intento_header(self, intento: int) -> str:
         if intento == 1: return "✅✅ ENTRADA CONFIRMADA ✅✅"
-        if intento == 2: return "🚨 SEGUNDA OPORTUNIDAD 🚨"
-        return "🚨 TERCERA OPORTUNIDAD 🚨"
+        return "☑️☑️ SEGUNDA OPORTUNIDAD ☑️☑️"
 
     def _strat_icon(self) -> str:
         return {STRAT_E1: "🅐", STRAT_E2: "🅑", STRAT_E3: "🅒"}.get(
@@ -1280,17 +1286,17 @@ class SpeedRouletteEngine:
         pair_disp = f"D{p[0]} y D{p[1]}"
         header    = self._intento_header(self.active_intento)
         icon      = self._strat_icon()
-        nivel_tag = f" Nv.{self.gestor.nivel}" if self.gestor.nivel > 1 else ""
         return (
             f"{header}\n\n"
-            f"🕹️ SPEED ROULETTE 1 {icon}{nivel_tag}\n"
-            f"🎯 Docenas: {pair_disp}\n\n"
-            f"🚨 MONTO DE APUESTA POR PAIS:\n"
-            f"{self._format_bets(bet_usd)}"
+            f"🕹️ SPEED ROULETTE 1\n"
+            f"🌟 Estrategia {icon}\n"
+            f"❄️ Docenas: {pair_disp}\n"
+            f"🇺🇲 USD: ${bet_usd:.2f} x Docena\n\n"
+            f"{SPEED_LINKS}"
         )
 
     def _send_signal(self):
-        msg_id = tg_send(self._build_signal_text(), markup=speed_keyboard())
+        msg_id = tg_send(self._build_signal_text())
         if msg_id:
             self.active_signal_msg_id = msg_id
 
@@ -1343,9 +1349,9 @@ class SpeedRouletteEngine:
             self.gestor.verificar_recuperacion(self.bankroll)
             sign = "+" if signal_profit >= 0 else ""
             tg_send(
-                f"✅ WIN #{number} — DOCENA D{d} — Op. #{self.active_intento}\n"
-                f"🎉 {sign}{signal_profit:.2f} USD 🎉\n"
-                f"💰 Balance: ${self.bankroll:.2f} USD | Nivel: {self.gestor.nivel}"
+                f"✅ WIN #{number} — DOCENA D{d}\n"
+                f"💵 Balance: ${self.bankroll:.2f} USD\n"
+                f"🎉 Felicitaciones +{spin_profit:.2f} USD"
             )
             self.stats.record('WIN', self.active_intento, number, d,
                               self.bankroll, self.active_strategy)
@@ -1389,10 +1395,9 @@ class SpeedRouletteEngine:
                 icon = self._strat_icon()
                 next_nivel = self.gestor.nivel + 1 if self.gestor.nivel < MAX_NIVEL else 1
                 tg_send(
-                    f"❌ LOSS #{number} — DOCENA D{d} — {icon} 3 intentos\n"
-                    f"🚨 -{self.total_signal_loss:.2f} USD 🚨\n"
-                    f"💰 Balance: ${self.bankroll:.2f} USD | "
-                    f"Nivel: {self.gestor.nivel}→{next_nivel}"
+                    f"❌ LOSS #{number} — DOCENA D{d}\n"
+                    f"💵 Balance: ${self.bankroll:.2f} USD\n"
+                    f"🈴 Perdimos -${self.total_signal_loss:.2f} 🈴"
                 )
                 self.stats.record('LOSS', self.active_intento, number, d,
                                   self.bankroll, self.active_strategy)
@@ -1563,7 +1568,9 @@ def cmd_start(m):
         "🅑 E2: PHTML+EMA (sin umbral)\n"
         "🅒 E3: Retorno PF Break (umbral 78%)\n\n"
         "💰 Apuesta escala por nivel e intento:\n"
-        "  Int.1 → Nv×$0.10 | Int.2-3 → 3×Nv×$0.10\n\n"
+        "💰 Apuesta escala por nivel e intento:\n"
+        "  Int.1 → $0.10 | $0.90 | $8.10 (Nv.1/2/3)\n"
+        "  Int.2 → $0.30 | $2.70 | $24.30 (Nv.1/2/3)\n\n"
         "🧠 El bot aprende de cada señal:\n"
         "  · Registra condiciones y resultado\n"
         "  · Ajusta probabilidades futuras (±22%)\n\n"
@@ -1625,9 +1632,12 @@ def cmd_niveles(m):
     lines.append(f"\n<b>Tabla de apuestas:</b>")
     for nv in range(1, MAX_NIVEL + 1):
         tag = " ← actual" if nv == g.nivel else ""
+        mult = 9 ** (nv - 1)
+        bet1 = BASE_BET * mult
+        bet2 = 3 * BASE_BET * mult
         lines.append(
-            f"  Nv.{nv}: Int.1 ${nv*BASE_BET:.2f} | "
-            f"Int.2-3 ${3*nv*BASE_BET:.2f}{tag}"
+            f"  Nv.{nv}: Int.1 ${bet1:.2f} | "
+            f"Int.2 ${bet2:.2f}{tag}"
         )
     bot.reply_to(m, "\n".join(lines), parse_mode="HTML")
 
