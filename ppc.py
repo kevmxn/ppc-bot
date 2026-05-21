@@ -102,8 +102,8 @@ MAX_INTENTOS    = 2
 TRAIN_INTERVAL  = 100
 
 # Pesos PHF = PHTML(60%) + PH(40%)
-PHTML_W         = 0.55
-PH_W_COMBINE    = 0.45
+PHTML_W         = 0.65
+PH_W_COMBINE    = 0.35
 
 # Pesos señal E1
 PF_W_NORM  = 0.70; PH_W_NORM  = 0.30
