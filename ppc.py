@@ -40,8 +40,8 @@ AR_TZ = timezone(timedelta(hours=-3))
 SEQUENCE =  ["NEGRO", "ROJO", "NEGRO", "NEGRO", "ROJO", "ROJO", "ROJO", "NEGRO", "ROJO", "ROJO",
 "NEGRO", "ROJO", "NEGRO", "NEGRO"]
 
-SYNC_MATCH   = 5         # giros consecutivos que deben coincidir con la secuencia para SINCRONIZAR
-WAIT_SPINS   = 4         # giros de espera entre señales antes de emitir la siguiente
+SYNC_MATCH   = 5        # giros consecutivos que deben coincidir con la secuencia para SINCRONIZAR
+WAIT_SPINS   = 9         # giros de espera entre señales antes de emitir la siguiente
 BET_ATTEMPTS = 3         # intentos reales de apuesta
 
 MESA_NAME    = "RUSSIAN ROULETTE"
