@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-SPACEMAN HTML Strategy Bot — Telegram + Render  [v14 — agentes optimizados anti-ruido]
+SPACEMAN HTML Strategy Bot — Telegram + Render  [v15 — 10 patrones optimizados para 1.8x]
 ────────────────────────────────────────────────────────────────────────────
-Estrategia: 3 patrones optimizados + sistema de agentes mejorado:
-  • PATRÓN V1 💎 (video): zona de confianza 30-40% + filtros
+Estrategia: 10 patrones optimizados para cuota 1.80x:
+  • PATRÓN V1 💎 (video): zona de confianza 30-40% + filtros mejorados
   • PATRÓN V2 💎 (combo_verde_agresiva): combo verde + umbral 4.0x + filtros
   • PATRÓN V3 💎 (martillo): rebote martillo + filtros de profundidad
-+ Sistema de 8 agentes con SCORE PONDERADO (anti-ruido):
-  - Score continuo -100 a +100 en lugar de votos binarios
-  - Pesos por confiabilidad de cada agente
-  - Filtro de coherencia (descarta si muy divididos)
-  - Confirmación temporal (2 cuotas seguidas)
-  - Filtro de volatilidad (descarta mercados extremos)
+  • PATRÓN V4 💎 (intercalado): alternancia bajo/alto detectada
+  • PATRÓN V5 💎 (dos_azules): 2 bajos consecutivos + rebote alto
+  • PATRÓN V6 💎 (soporte_dinamico): rebote en soporte/EMA
+  • PATRÓN V7 💎 (tendencia_media): EMA8 alcista confirmada
+  • PATRÓN V8 💎 (multi_agente): 5+ agentes a favor + score alto
+  • PATRÓN V9 💎 (fibonacci_rebote): rebote en 61.8% Fibonacci
+  • PATRÓN V10  (rsi_extremo): RSI sobreventa/sobrecompra extrema
++ Sistema de 8 agentes con SCORE PONDERADO (anti-ruido)
 + Emisión inmediata cuando tendencia es CLARAMENTE ALCISTA FUERTE
-Mecánica de confirmación: intento 1 silencioso a 1.60x. Si falla, se envía
-señal para intento 2 y 3 (gana si cualquiera >= 2.00x).
-Emisión inmediata: 2 intentos directos sin confirmación previa.
+Mecánica de confirmación: intento 1 silencioso a 1.70x. Si falla, se envía
+señal para intento 2 y 3 (gana si cualquiera >= 1.80x).
 """
 import asyncio
 import sqlite3
@@ -40,7 +41,7 @@ try:
 except ImportError:
     ML_LIBS_OK = False
 
-# ─── LOGGING ──────────────────────────────────────────────────────────────────
+# ── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     level=logging.INFO
@@ -58,7 +59,7 @@ CURRENCY  = os.environ.get("CURRENCY",  "BRL")
 GAME_ID   = int(os.environ.get("GAME_ID", "1301"))
 DB_FILE = os.environ.get("DB_FILE", "spaceman.db")
 
-# ─── CONFIG — ML ──────────────────────────────────────────────────────────────
+# ── CONFIG — ML ──────────────────────────────────────────────────────────────
 MODEL_FILE     = os.environ.get("MODEL_FILE", "signal_model.joblib")
 MODEL_MIN_PROB = float(os.environ.get("MODEL_MIN_PROB", "0.55"))
 AUTO_TRAIN_ENABLED     = os.environ.get("AUTO_TRAIN_ENABLED", "1") == "1"
@@ -72,15 +73,15 @@ def colombia_now() -> datetime:
 def colombia_time() -> str:
     return colombia_now().strftime("%H:%M")
 
-# ─── UMBRALES DE TENDENCIA ──────────
+# ─── UMBRALES DE TENDENCIA ─────────
 UMBRAL_BELOW2 = 53.51
 UMBRAL_2TO5   = 26.99
 HISTORY_MAX   = 150
 
-# ─── CUOTA ÚNICA ───────────────────
-CASHOUT_TARGET  = 1.80
-CASHOUT_TRIGGER = 1.80
-CONFIRM_TRIGGER = 1.70
+# ─── CUOTA OPTIMIZADA PARA 1.8x (v15) ─────────────────────────────────────
+CASHOUT_TARGET  = 1.80   # OBJETIVO: 1.80x
+CASHOUT_TRIGGER = 1.80   # Se gana con >= 1.80x
+CONFIRM_TRIGGER = 1.70   # Confirmación intento 1: si >= 1.70x descarta
 
 # ─── MECÁNICA DE CONFIRMACIÓN ───────
 MAX_ATTEMPTS_NORMAL    = 3
@@ -89,7 +90,7 @@ MAX_ATTEMPTS_IMMEDIATE = 2
 GAME_LINK = "https://1win.lat/casino/play/v_pragmatic:spaceman"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CONSTANTES DEL SISTEMA HTML
+# CONSTANTES DEL SISTEMA HTML OPTIMIZADAS v15
 # ═══════════════════════════════════════════════════════════════════════════
 UMBRAL_ACTIVACION      = 30
 MAX_LUCKY_GALES        = 2
@@ -98,7 +99,7 @@ COOLDOWN_ROJO          = 6
 NIVEL_SOBREVENTA       = -4
 RACHA_SOBREVENTA       = 4
 
-# ─── NUEVOS UMBRALES OPTIMIZADOS (v14) ──────────────────────────────────────
+# ─── NUEVOS UMBRALES OPTIMIZADOS v15 (para 1.8x) ──────────────────────────
 CONF_ALERTA_MIN        = 30
 CONF_ALERTA_MAX        = 40
 UMBRAL_AGRESIVO_V2     = 4.0
@@ -106,38 +107,51 @@ UMBRAL_VALLE_V3        = 1.5
 DIST_MIN_EMA8_V3       = 1.05
 DIST_MAX_EMA8_V3       = 1.50
 
-# ─── NUEVOS UMBRALES ANTI-RUIDO (v14) ───────────────────────────────────────
-SCORE_UMBRAL_EMISION   = 35   # score ponderado mínimo para emitir señal
-SCORE_UMBRAL_INMEDIATA = 45   # score mínimo para emisión inmediata
-COHERENCIA_MIN_DIFF    = 2    # diferencia mínima entre entrar/no_entrar
-CONFIRMACION_MIN_CUOTAS = 2   # cuotas consecutivas para confirmar señal
-VOLATILIDAD_STD_MIN    = 0.3  # std mínimo (mercado muy plano = ruido)
-VOLATILIDAD_STD_MAX    = 3.0  # std máximo (mercado muy volátil = ruido)
+# UMBRALES ANTI-RUIDO
+SCORE_UMBRAL_EMISION   = 35
+SCORE_UMBRAL_INMEDIATA = 45
+COHERENCIA_MIN_DIFF    = 2
+CONFIRMACION_MIN_CUOTAS = 2
+VOLATILIDAD_STD_MIN    = 0.3
+VOLATILIDAD_STD_MAX    = 3.0
+
+# ─── NUEVOS UMBRALES PARA PATRONES 1.8x ───────────────────────────────────
+UMBRAL_INTERCALADO     = 3    # mínimo de alternancias para activar
+UMBRAL_DOS_AZULES      = 2    # valores bajos consecutivos
+UMBRAL_FIB_REBOTE      = 0.618  # nivel Fibonacci 61.8%
+RSI_SOBREVENTA         = 30   # RSI sobreventa
+RSI_SOBRECOMPRA        = 70   # RSI sobrecompra
+DISTANCIA_SOPORTE_MAX  = 0.8  # distancia máxima al soporte
 
 SOPORTE_COOLDOWN       = 5
 MIN_DATOS_ENTRE_TOQUES = 2
 TOQUES_NECESARIOS      = 3
 RANGO_KEYS = ['muyBajo', 'bajo', 'medio', 'medioAlto', 'alto']
 
-# ─── MAPEO DE PATRONES ──────────────────────────────────────────────────────
+# ─── MAPEO DE PATRONES v15 (10 patrones) ──────────────────────────────────
 ALERT_LABELS = {
-    'video':                'PATRON V1 💎',
-    'combo_verde_agresiva': 'PATRON V2 💎',
-    'martillo':             'PATRON V3 💎',
+    'video':                'PATRÓN V1 💎',
+    'combo_verde_agresiva': 'PATRÓN V2 💎',
+    'martillo':             'PATRÓN V3 💎',
+    'intercalado':          'PATRÓN V4 💎',
+    'dos_azules':           'PATRÓN V5 💎',
+    'soporte_dinamico':     'PATRÓN V6 💎',
+    'tendencia_media':      'PATRÓN V7 💎',
+    'multi_agente':         'PATRÓN V8 💎',
+    'fibonacci_rebote':     'PATRÓN V9 💎',
+    'rsi_extremo':          'PATRÓN V10 💎',
 }
 
-PATTERN_ORDER = ['video', 'combo_verde_agresiva', 'martillo']
+PATTERN_ORDER = [
+    'video', 'combo_verde_agresiva', 'martillo', 'intercalado',
+    'dos_azules', 'soporte_dinamico', 'tendencia_media',
+    'multi_agente', 'fibonacci_rebote', 'rsi_extremo',
+]
 
-# ─── PESOS DE AGENTES (v14 — confiabilidad por agente) ──────────────────────
+# ─── PESOS DE AGENTES ─────────────────────────────────────────────────────
 AGENT_WEIGHTS = {
-    'a1': 1.2,  # EMAs (tendencia)
-    'a2': 1.5,  # S/R (soporte/resistencia)
-    'a3': 0.8,  # Historial (menos confiable)
-    'a4': 1.3,  # RSI+MACD (indicadores técnicos)
-    'a5': 1.0,  # Estadístico
-    'a6': 1.1,  # Bloques
-    'a7': 0.7,  # Rachas (redundante, menos peso)
-    'a8': 1.2,  # Fuerza
+    'a1': 1.2, 'a2': 1.5, 'a3': 0.8, 'a4': 1.3,
+    'a5': 1.0, 'a6': 1.1, 'a7': 0.7, 'a8': 1.2,
 }
 
 # ─── SQLITE — ESQUEMA ─────────────────────────────────────────────────────────
@@ -226,7 +240,7 @@ def load_state():
     ml_last_trained_count = int(d.get("ml_last_trained_count", "0") or "0")
     candidato_pendiente_key = d.get("candidato_pendiente_key", "") or None
     candidato_pendiente_idx = int(d.get("candidato_pendiente_idx", "-999") or "-999")
-    logger.info(f"[v14] Estado cargado | estado={sig_state} intento={sig_attempt} tipo={sig_tipo} inmediata={sig_inmediata}")
+    logger.info(f"[v15] Estado cargado | estado={sig_state} intento={sig_attempt} tipo={sig_tipo}")
 
 def _save_dict(values: dict):
     try:
@@ -314,7 +328,7 @@ def get_pattern_stats_24h() -> Dict[str, dict]:
 def build_pattern_stats_msg() -> str:
     data = get_pattern_stats_24h()
     lines = [
-        "📊 <b>EFECTIVIDAD POR PATRÓN — Últimas 24h</b>",
+        " <b>EFECTIVIDAD POR PATRÓN — Últimas 24h</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━",
     ]
     total_wins = total_losses = 0
@@ -367,7 +381,6 @@ daily_losses:      int           = 0
 consecutive_wins:  int           = 0
 consecutive_losses: int          = 0
 
-# ─── CONFIRMACIÓN TEMPORAL (v14 — anti-ruido) ─────────────────────────────
 candidato_pendiente_key: Optional[str] = None
 candidato_pendiente_idx: int = -999
 
@@ -385,7 +398,7 @@ async def send_msg(text: str, no_preview: bool = False) -> Optional[int]:
         )
         return msg.message_id
     except Exception as e:
-        logger.warning(f"[v14] send error: {e}")
+        logger.warning(f"[v15] send error: {e}")
         return None
 
 async def edit_msg(msg_id: int, text: str, no_preview: bool = False) -> bool:
@@ -396,7 +409,7 @@ async def edit_msg(msg_id: int, text: str, no_preview: bool = False) -> bool:
         )
         return True
     except Exception as e:
-        logger.debug(f"[v14] edit error {msg_id}: {e}")
+        logger.debug(f"[v15] edit error {msg_id}: {e}")
         return False
 
 async def delete_msg(msg_id: int) -> bool:
@@ -404,7 +417,7 @@ async def delete_msg(msg_id: int) -> bool:
         await bot.delete_message(CHAT_ID, msg_id)
         return True
     except Exception as e:
-        logger.debug(f"[v14] delete error {msg_id}: {e}")
+        logger.debug(f"[v15] delete error {msg_id}: {e}")
         return False
 
 # ─── ANÁLISIS DE TENDENCIA ────────────────────────────────────────────────────
@@ -498,19 +511,24 @@ def calcular_regresion_lineal(data: List[float]):
     return slope, r2
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FILTROS OPTIMIZADOS v14 — para V1, V2, V3
+# FILTROS OPTIMIZADOS v15 (para 1.8x)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def filtro_v1_video(vals: List[float], ema8: List[float]) -> bool:
+    """V1 optimizado para 1.8x: filtros más estrictos"""
     if len(vals) < 3 or len(ema8) < 2:
         return False
     if not all(v < 2.0 for v in vals[-3:]):
         return False
     if not (ema8[-1] > ema8[-2]):
         return False
+    # Filtro adicional: último valor debe estar cerca de 1.8x
+    if vals[-1] > 1.9:
+        return False
     return True
 
 def filtro_v2_combo(vals: List[float], ema4: List[float], ema8: List[float]) -> bool:
+    """V2 optimizado para 1.8x"""
     if len(vals) < 5 or not ema4 or not ema8:
         return False
     ultimos_5 = vals[-5:]
@@ -522,6 +540,7 @@ def filtro_v2_combo(vals: List[float], ema4: List[float], ema8: List[float]) -> 
     return True
 
 def filtro_v3_martillo(vals: List[float], ema8: List[float]) -> bool:
+    """V3 optimizado para 1.8x"""
     if len(vals) < 3 or len(ema8) < 3:
         return False
     if vals[-2] >= UMBRAL_VALLE_V3:
@@ -537,15 +556,171 @@ def filtro_v3_martillo(vals: List[float], ema8: List[float]) -> bool:
     return True
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FILTRO DE VOLATILIDAD (v14 — anti-ruido)
+# NUEVOS PATRONES v15 (del HTML Aviator)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def detectar_intercalado(vals: List[float]) -> bool:
+    """
+    V4: Patrón Intercalado — alternancia bajo/alto
+    Detecta secuencias como: 1.2x, 2.5x, 1.3x, 2.8x, 1.1x...
+    Requiere al menos 3 alternancias en los últimos 8 valores
+    """
+    if len(vals) < 8:
+        return False
+    
+    ultimos_8 = vals[-8:]
+    alternancias = 0
+    
+    for i in range(1, len(ultimos_8)):
+        prev_bajo = ultimos_8[i-1] < 2.0
+        curr_alto = ultimos_8[i] >= 2.0
+        prev_alto = ultimos_8[i-1] >= 2.0
+        curr_bajo = ultimos_8[i] < 2.0
+        
+        if (prev_bajo and curr_alto) or (prev_alto and curr_bajo):
+            alternancias += 1
+    
+    # Si hay al menos 3 alternancias y el último fue bajo (preparando alto)
+    if alternancias >= UMBRAL_INTERCALADO and ultimos_8[-1] < 2.0:
+        return True
+    
+    return False
+
+def detectar_dos_azules(vals: List[float], niveles: List[float]) -> bool:
+    """
+    V5: Patrón 2 Azules — dos valores bajos consecutivos seguidos de rebote
+    Similar al patrón "2 blues" de Aviator: 2 valores < 2.0 seguidos
+    y el tercero debe ser >= 1.8x
+    """
+    if len(vals) < 3 or len(niveles) < 3:
+        return False
+    
+    # Los últimos 2 deben ser bajos
+    if not (vals[-2] < 2.0 and vals[-3] < 2.0):
+        return False
+    
+    # El actual debe ser alto (rebote)
+    if vals[-1] < 1.8:
+        return False
+    
+    # Verificar que no venga de una racha muy larga de bajos
+    racha_bajos = 0
+    for i in range(len(vals) - 1, -1, -1):
+        if vals[i] < 2.0:
+            racha_bajos += 1
+        else:
+            break
+    
+    # Si la racha es muy larga (>6), es riesgoso
+    if racha_bajos > 6:
+        return False
+    
+    return True
+
+def detectar_soporte_dinamico(vals: List[float], ema8: List[float], 
+                               ema20: List[float], niveles: List[float]) -> bool:
+    """
+    V6: Soporte Dinámico — rebote en soporte/EMA
+    El valor actual rebota sobre EMA8 o EMA20 usadas como soporte dinámico
+    """
+    if len(vals) < 3 or not ema8 or not ema20:
+        return False
+    
+    current = vals[-1]
+    e8 = ema8[-1]
+    e20 = ema20[-1]
+    
+    # Verificar rebote: el valor anterior estaba cerca del soporte
+    prev = vals[-2]
+    dist_prev_e8 = abs(prev - e8)
+    dist_prev_e20 = abs(prev - e20)
+    
+    # El anterior debe haber estado cerca de un soporte
+    cerca_soporte = dist_prev_e8 <= DISTANCIA_SOPORTE_MAX or dist_prev_e20 <= DISTANCIA_SOPORTE_MAX
+    
+    # El actual debe rebotar al alza
+    rebote = current > prev and current >= 1.8
+    
+    # Las EMAs deben estar subiendo
+    emas_subiendo = len(ema8) >= 2 and ema8[-1] > ema8[-2]
+    
+    return cerca_soporte and rebote and emas_subiendo
+
+def detectar_tendencia_media(ema8: List[float], ema20: List[float]) -> bool:
+    """
+    V7: Tendencia Media — EMA8 alcista confirmada
+    EMA8 con pendiente positiva y por encima de EMA20
+    """
+    if len(ema8) < 8 or not ema20:
+        return False
+    
+    ventana = ema8[-8:] if len(ema8) >= 8 else ema8
+    slope, r2 = calcular_regresion_lineal(ventana)
+    
+    # Pendiente positiva y fuerte
+    if slope <= 0.03:
+        return False
+    
+    # EMA8 por encima de EMA20
+    if ema8[-1] <= ema20[-1]:
+        return False
+    
+    # EMA8 subiendo en los últimos 2 periodos
+    if len(ema8) >= 2 and ema8[-1] <= ema8[-2]:
+        return False
+    
+    return True
+
+def detectar_fibonacci_rebote(vals: List[float], fib: dict) -> bool:
+    """
+    V9: Fibonacci Rebote — rebote en nivel 61.8%
+    El valor actual rebota desde el nivel 61.8% de Fibonacci
+    """
+    if not fib or len(vals) < 3:
+        return False
+    
+    fib_618 = fib.get('61.8%')
+    if fib_618 is None:
+        return False
+    
+    current = vals[-1]
+    prev = vals[-2]
+    
+    # El anterior debe haber estado cerca del 61.8%
+    dist_prev = abs(prev - fib_618)
+    cerca_fib = dist_prev <= 0.5
+    
+    # El actual debe rebotar al alza
+    rebote = current > prev and current >= 1.8
+    
+    return cerca_fib and rebote
+
+def detectar_rsi_extremo(rsi: List[float], vals: List[float]) -> bool:
+    """
+    V10: RSI Extremo — sobreventa/sobrecompra extrema
+    RSI < 30 (sobreventa) o RSI > 70 (sobrecompra) con rebote
+    """
+    if not rsi or len(rsi) < 2 or len(vals) < 2:
+        return False
+    
+    rsi_actual = rsi[-1]
+    rsi_anterior = rsi[-2]
+    
+    # Sobreventa extrema saliendo
+    if rsi_actual < RSI_SOBREVENTA and rsi_actual > rsi_anterior and vals[-1] >= 1.8:
+        return True
+    
+    # Sobrecompra extrema entrando (para corto)
+    if rsi_actual > RSI_SOBRECOMPRA and vals[-1] >= 1.8:
+        return True
+    
+    return False
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FILTRO DE VOLATILIDAD
 # ═══════════════════════════════════════════════════════════════════════════
 
 def filtro_volatilidad(vals: List[float]) -> bool:
-    """
-    Descarta señales en mercados extremos:
-      - Muy plano (std < 0.3): agentes fallan
-      - Muy volátil (std > 3.0): demasiado ruido
-    """
     if len(vals) < 10:
         return True
     ultimos_10 = vals[-10:]
@@ -559,7 +734,7 @@ def filtro_volatilidad(vals: List[float]) -> bool:
     return True
 
 # ═══════════════════════════════════════════════════════════════════════════
-# EMISIÓN INMEDIATA — condiciones detalladas
+# EMISIÓN INMEDIATA
 # ═══════════════════════════════════════════════════════════════════════════
 
 def es_tendencia_claramente_alcista_fuerte(vals, ema4, ema8, ema20, rsi, tendencia_lucky) -> bool:
@@ -617,7 +792,7 @@ def detectar_martillo_base(vals: List[float], ema8: List[float]) -> bool:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SOPORTE/RESISTENCIA · RSI · MACD · FIBONACCI
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 def calcular_soporte_resistencia_fuerte(niveles: List[float]) -> dict:
     if len(niveles) < 10:
@@ -665,7 +840,7 @@ def calcular_fibonacci(niveles: List[float]) -> dict:
     diff = mx - mn
     return {'0.0%': mx, '38.2%': mx - diff * 0.382, '61.8%': mx - diff * 0.618, '100.0%': mn}
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # ESTADÍSTICAS AVANZADAS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -799,9 +974,9 @@ def generar_recomendacion_agente6(vals: List[float]) -> dict:
         tipo = 'analizando'
     return {'tipo': tipo, 'racha': racha_actual, 'totalBajos30': total_bajos30}
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # AGENTE 7 — RACHAS DE RANGO
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 def obtener_rango(v: float) -> str:
     if v < 1.50: return 'muyBajo'
@@ -846,16 +1021,12 @@ def calcular_fuerza(vals: List[float]):
     return {'velocidad': velocidad, 'tendencia': tendencia}
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SISTEMA DE 8 AGENTES — SCORE PONDERADO (v14 — anti-ruido)
+# SISTEMA DE 8 AGENTES — SCORE PONDERADO
 # ═══════════════════════════════════════════════════════════════════════════
 
 def ejecutar_multiagente(vals, niveles, ema4, ema8, ema20, ema50, rsi, macd, fib,
                          sr_strong, stats, agente6, racha_rango_activa,
                          rango_activo, rangos_racha, fuerza, ia_prob):
-    """
-    v14: Score continuo ponderado (-100 a +100) en lugar de votos binarios.
-    Cada agente tiene un peso según su confiabilidad histórica.
-    """
     current = niveles[-1]
     scores = {}
     
@@ -958,26 +1129,14 @@ def ejecutar_multiagente(vals, niveles, ema4, ema8, ema20, ema50, rsi, macd, fib
     return score_pct, contar_entrar, contar_no_entrar, votos, scores
 
 def agentes_bloquean_señal(score_pct, contar_entrar, contar_no_entrar) -> bool:
-    """
-    v14: Bloquea señal si:
-      - Score ponderado < 35%
-      - Filtro de coherencia: diferencia <= 1 (muy divididos)
-    """
-    # Filtro de coherencia
     diff_abs = abs(contar_entrar - contar_no_entrar)
     if diff_abs < COHERENCIA_MIN_DIFF:
         return True
-    # Score mínimo
     if score_pct < SCORE_UMBRAL_EMISION:
         return True
     return False
 
 def agentes_permiten_emision_inmediata(score_pct, contar_entrar, contar_no_entrar) -> bool:
-    """
-    v14: Permite emisión inmediata si:
-      - Score ponderado >= 45%
-      - Filtro de coherencia: diferencia >= 2
-    """
     diff_abs = abs(contar_entrar - contar_no_entrar)
     if diff_abs < COHERENCIA_MIN_DIFF:
         return False
@@ -986,7 +1145,7 @@ def agentes_permiten_emision_inmediata(score_pct, contar_entrar, contar_no_entra
     return True
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MOTOR DE ESTRATEGIA v14
+# MOTOR DE ESTRATEGIA v15 — 10 PATRONES OPTIMIZADOS PARA 1.8x
 # ═══════════════════════════════════════════════════════════════════════════
 
 class HtmlEngine:
@@ -995,19 +1154,21 @@ class HtmlEngine:
         self.last_video_idx   = -999
         self.last_combo_idx   = -999
         self.last_martillo_idx = -999
+        self.last_intercalado_idx = -999
+        self.last_dos_azules_idx = -999
+        self.last_soporte_idx = -999
+        self.last_tendencia_media_idx = -999
+        self.last_fib_idx = -999
+        self.last_rsi_idx = -999
         self.fuerza_memoria   = []
 
     def evaluar(self, vals: List[float]):
-        """
-        v14: Con confirmación temporal (2 cuotas seguidas) + filtro de volatilidad.
-        Devuelve (tipo_key, label, motivo, features_json, es_inmediata)
-        """
         if len(vals) < 3:
             return None
 
         # Filtro de volatilidad
         if not filtro_volatilidad(vals):
-            logger.debug("[v14] 🛑 Volatilidad extrema — no evaluar")
+            logger.debug("[v15] 🛑 Volatilidad extrema — no evaluar")
             return None
 
         niveles = compute_niveles(vals)
@@ -1060,7 +1221,7 @@ class HtmlEngine:
         )
 
         if agentes_bloquean_señal(score_pct, contar_entrar, contar_no_entrar):
-            logger.info(f"[v14] 🛑 Agentes bloquean: score={score_pct:.1f}% diff={abs(contar_entrar-contar_no_entrar)}")
+            logger.info(f"[v15] 🛑 Agentes bloquean: score={score_pct:.1f}% diff={abs(contar_entrar-contar_no_entrar)}")
             return None
 
         agresiva_condicion = False
@@ -1092,12 +1253,7 @@ class HtmlEngine:
 
         candidatos = []
 
-        if nuevo == 'VERDE' and agresiva_condicion and filtro_v2_combo(vals, ema4, ema8):
-            self.last_combo_idx = idx
-            candidatos.append(('combo_verde_agresiva', ALERT_LABELS['combo_verde_agresiva'],
-                               f'Tendencia VERDE + máx≥{UMBRAL_AGRESIVO_V2}x + EMA4>EMA8',
-                               dict(features_base)))
-
+        # V1: Video (zona de confianza)
         if len(vals) >= 5:
             conf = int(confidence)
             if CONF_ALERTA_MIN <= conf <= CONF_ALERTA_MAX and filtro_v1_video(vals, ema8):
@@ -1106,10 +1262,66 @@ class HtmlEngine:
                                    f'Confianza {conf}% + últimos 3 < 2x + EMA8 subiendo',
                                    dict(features_base)))
 
+        # V2: Combo verde agresiva
+        if nuevo == 'VERDE' and agresiva_condicion and filtro_v2_combo(vals, ema4, ema8):
+            self.last_combo_idx = idx
+            candidatos.append(('combo_verde_agresiva', ALERT_LABELS['combo_verde_agresiva'],
+                               f'Tendencia VERDE + máx≥{UMBRAL_AGRESIVO_V2}x + EMA4>EMA8',
+                               dict(features_base)))
+
+        # V3: Martillo
         if detectar_martillo_base(vals, ema8) and filtro_v3_martillo(vals, ema8):
             self.last_martillo_idx = idx
             candidatos.append(('martillo', ALERT_LABELS['martillo'],
                                f'Martillo + valle<{UMBRAL_VALLE_V3}x + EMA8 subiendo 3 periodos',
+                               dict(features_base)))
+
+        # V4: Intercalado
+        if detectar_intercalado(vals):
+            self.last_intercalado_idx = idx
+            candidatos.append(('intercalado', ALERT_LABELS['intercalado'],
+                               f'Patrón intercalado detectado ({UMBRAL_INTERCALADO}+ alternancias)',
+                               dict(features_base)))
+
+        # V5: Dos Azules
+        if detectar_dos_azules(vals, niveles):
+            self.last_dos_azules_idx = idx
+            candidatos.append(('dos_azules', ALERT_LABELS['dos_azules'],
+                               '2 valores bajos consecutivos + rebote >= 1.8x',
+                               dict(features_base)))
+
+        # V6: Soporte Dinámico
+        if detectar_soporte_dinamico(vals, ema8, ema20, niveles):
+            self.last_soporte_idx = idx
+            candidatos.append(('soporte_dinamico', ALERT_LABELS['soporte_dinamico'],
+                               'Rebote en soporte/EMA dinámico',
+                               dict(features_base)))
+
+        # V7: Tendencia Media
+        if detectar_tendencia_media(ema8, ema20):
+            self.last_tendencia_media_idx = idx
+            candidatos.append(('tendencia_media', ALERT_LABELS['tendencia_media'],
+                               'EMA8 alcista confirmada sobre EMA20',
+                               dict(features_base)))
+
+        # V8: Multi-Agente (5+ agentes a favor)
+        if contar_entrar >= 5 and score_pct >= 40:
+            candidatos.append(('multi_agente', ALERT_LABELS['multi_agente'],
+                               f'{contar_entrar}/8 agentes a favor (score {score_pct:.1f}%)',
+                               dict(features_base)))
+
+        # V9: Fibonacci Rebote
+        if detectar_fibonacci_rebote(vals, fib):
+            self.last_fib_idx = idx
+            candidatos.append(('fibonacci_rebote', ALERT_LABELS['fibonacci_rebote'],
+                               'Rebote en nivel 61.8% Fibonacci',
+                               dict(features_base)))
+
+        # V10: RSI Extremo
+        if detectar_rsi_extremo(rsi, vals):
+            self.last_rsi_idx = idx
+            candidatos.append(('rsi_extremo', ALERT_LABELS['rsi_extremo'],
+                               f'RSI extremo (sobreventa/sobrecompra)',
                                dict(features_base)))
 
         if not candidatos:
@@ -1121,17 +1333,15 @@ class HtmlEngine:
 
         tipo_key, label, motivo, features = elegido
 
-        # Confirmación temporal (v14)
+        # Confirmación temporal
         global candidato_pendiente_key, candidato_pendiente_idx
         if candidato_pendiente_key == tipo_key and idx - candidato_pendiente_idx == 1:
-            # ✅ Confirmado por 2 cuotas seguidas
             candidato_pendiente_key = None
             candidato_pendiente_idx = -999
         else:
-            # Guardar como pendiente
             candidato_pendiente_key = tipo_key
             candidato_pendiente_idx = idx
-            return None  # aún no emitir
+            return None
 
         # ¿EMISIÓN INMEDIATA?
         es_inmediata = False
@@ -1143,7 +1353,7 @@ class HtmlEngine:
                     features['emision_inmediata'] = True
                     features['opc_cumplidas'] = opc_cumplidas
                     motivo += f' | 🚀 INMEDIATA (opc={opc_cumplidas}/3)'
-                    logger.info(f"[v14] 🚀 Emisión inmediata: {tipo_key} | score={score_pct:.1f}% opc={opc_cumplidas}/3")
+                    logger.info(f"[v15] 🚀 Emisión inmediata: {tipo_key} | score={score_pct:.1f}% opc={opc_cumplidas}/3")
 
         return tipo_key, label, motivo, json.dumps(features, default=str), es_inmediata
 
@@ -1193,11 +1403,11 @@ def flatten_features(tipo_key: str, features: dict) -> dict:
         if bool_col in flat and flat[bool_col] is not None:
             flat[bool_col] = int(bool(flat[bool_col]))
     flat.pop('ml_prob', None)
-    flat.pop('scores', None)  # no se usa como feature
+    flat.pop('scores', None)
     flat['tipo_key'] = tipo_key
     return flat
 
-# ─── ML — INFERENCIA ──────────────────────────────────────────────────────────
+# ─── ML — INFERENCIA ─────────────────────────────────────────────────────────
 ml_model = None
 ml_feature_columns: List[str] = []
 ml_categorical_columns: List[str] = []
@@ -1339,7 +1549,7 @@ async def auto_train_loop():
 # ─── MENSAJES ─────────────────────────────────────────────────────────────────
 def build_signal_msg(tipo_label: str, last_value: float, es_inmediata: bool = False) -> str:
     if es_inmediata:
-        header = "<b>⚡⚡ ENTRADA INMEDIATA ⚡⚡</b>"
+        header = "<b>⚡ ENTRADA INMEDIATA ⚡</b>"
     else:
         header = "<b>✅✅ ENTRADA CONFIRMADA ✅✅</b>"
     return (
@@ -1353,7 +1563,7 @@ def build_signal_msg(tipo_label: str, last_value: float, es_inmediata: bool = Fa
 
 def build_win_msg(result: float, tipo_label: str, intento: int) -> str:
     return (
-        "<b>🍀🍀🍀 GANAMOS!!! 🍀🍀🍀</b>\n"
+        "<b>🍀🍀🍀 GANAMOS!!! 🍀🍀</b>\n"
         f"<b>✅ Resultado: {result:.2f}x — {tipo_label}</b>"
     )
 
@@ -1382,13 +1592,13 @@ async def send_stats_update():
     stats_msg_id = await send_msg(build_stats_msg())
     save_state()
 
-# ─── MÁQUINA DE ESTADOS ──────────────────────────────────────────────────────
+# ─── MÁQUINA DE ESTADOS ─────────────────────────────────────────────────────
 async def resolve_pending(value: float):
     global sig_state, sig_attempt, sig_last_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
     label = sig_tipo or "Señal HTML"
     key   = sig_tipo_key or "desconocido"
     if value >= CONFIRM_TRIGGER:
-        logger.info(f"[v14] ⏭️ Intento 1 confirmó {value:.2f}x — señal descartada | {label}")
+        logger.info(f"[v15] ⏭️ Intento 1 confirmó {value:.2f}x — señal descartada | {label}")
         sig_state = "idle"
         sig_attempt = 0
         sig_tipo = None
@@ -1397,7 +1607,7 @@ async def resolve_pending(value: float):
         sig_inmediata = False
         save_state()
     else:
-        logger.info(f"[v14] 🔎 Intento 1 falló ({value:.2f}x) — señal activa | {label}")
+        logger.info(f"[v15] 🔎 Intento 1 falló ({value:.2f}x) — señal activa | {label}")
         sig_state = "active"
         sig_attempt = 2
         sig_last_attempt = MAX_ATTEMPTS_NORMAL
@@ -1413,7 +1623,7 @@ async def resolve_active(value: float):
     key = sig_tipo_key or "desconocido"
     intento = sig_attempt
     if win:
-        logger.info(f"[v14] ✅ GANAMOS intento {intento} — {value:.2f}x | {label}")
+        logger.info(f"[v15] ✅ GANAMOS intento {intento} — {value:.2f}x | {label}")
         log_pattern_result(key, label, "win", value, attempt=intento, features_json=sig_features)
         daily_wins += 1
         consecutive_wins += 1
@@ -1429,16 +1639,16 @@ async def resolve_active(value: float):
         save_state()
         await send_stats_update()
     elif intento < sig_last_attempt:
-        logger.info(f"[v14] ⚠️ Intento {intento} falló ({value:.2f}x) — sigue intento {intento + 1} | {label}")
+        logger.info(f"[v15] ️ Intento {intento} falló ({value:.2f}x) — sigue intento {intento + 1} | {label}")
         sig_attempt = intento + 1
         save_state()
     else:
-        logger.info(f"[v14] ❌ PERDIMOS intento {intento} — {value:.2f}x | {label}")
+        logger.info(f"[v15] ❌ PERDIMOS intento {intento} — {value:.2f}x | {label}")
         log_pattern_result(key, label, "loss", value, attempt=intento, features_json=sig_features)
         daily_losses += 1
         consecutive_losses += 1
         if consecutive_losses >= 3:
-            logger.info("[v14] 🔻 3 pérdidas seguidas — racha reseteada")
+            logger.info("[v15] 🔻 3 pérdidas seguidas — racha reseteada")
             consecutive_wins = 0
             consecutive_losses = 0
         await send_msg(build_loss_msg(value, label, intento))
@@ -1483,13 +1693,13 @@ async def process_new_value(value: float, silent: bool = False):
                 text = build_signal_msg(label, value, es_inmediata=True)
                 sig_msg_id = await send_msg(text, no_preview=True)
                 save_state()
-                logger.info(f"[v14] ⚡ Señal INMEDIATA: {tipo_key} — {motivo}")
+                logger.info(f"[v15] ⚡ Señal INMEDIATA: {tipo_key} — {motivo}")
             else:
                 sig_state = "pending"
                 sig_attempt = 1
                 sig_last_attempt = MAX_ATTEMPTS_NORMAL
                 save_state()
-                logger.info(f"[v14] 🕓 Señal confirmada: {tipo_key} — {motivo}")
+                logger.info(f"[v15]  Señal confirmada: {tipo_key} — {motivo}")
 
 # ─── WEBSOCKET ────────────────────────────────────────────────────────────────
 async def ws_loop():
@@ -1529,7 +1739,7 @@ async def ws_loop():
 def home():
     stats = get_stats()
     return (
-        f"🤖 SpacemanBot v14 | hist:{len(history)} "
+        f" SpacemanBot v15 | hist:{len(history)} "
         f"| señal:{sig_state}{'(INM)' if sig_inmediata else ''} "
         f"| tend:{'🟢' if stats['favorable'] else '🔴'}"
     ), 200
@@ -1559,28 +1769,28 @@ def health():
 def ping():
     return 'pong', 200
 
-# ─── TELEGRAM COMMANDS ─────────────────────────────────────────────────────────
+# ─── TELEGRAM COMMANDS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def cmd_start(message):
     name  = message.from_user.first_name or "usuario"
     stats = get_stats()
     await bot.reply_to(message,
-        f"🚀 <b>¡Bienvenido {name}!</b>\n"
+        f" <b>¡Bienvenido {name}!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <b>SPACEMAN BOT v14 — ANTI-RUIDO</b>\n"
-        f"💰 <b>Objetivo único: ≥ {CASHOUT_TARGET:.2f}x</b>\n"
-        "🔁 <b>Confirmación intento 1 (1.60x) + intentos 2 y 3</b>\n"
+        "🤖 <b>SPACEMAN BOT v15 — 10 PATRONES 1.8x</b>\n"
+        f"💰 <b>Objetivo: ≥ {CASHOUT_TARGET:.2f}x</b>\n"
+        "🔁 <b>Confirmación intento 1 (1.70x) + intentos 2 y 3</b>\n"
         "⚡ <b>Emisión inmediata si tendencia alcista fuerte</b>\n"
-        "📡 <b>Fuentes de señal</b>\n"
-        "   💎 PATRÓN V1 — Zona de confianza (30-40%)\n"
-        "   💎 PATRÓN V2 — Combo verde agresivo (≥4.0x)\n"
-        "   💎 PATRÓN V3 — Martillo alcista optimizado\n"
+        "📡 <b>10 Patrones Optimizados</b>\n"
+        "   V1: Zona confianza · V2: Combo verde\n"
+        "   V3: Martillo · V4: Intercalado\n"
+        "   V5: Dos azules · V6: Soporte dinámico\n"
+        "   V7: Tendencia media · V8: Multi-agente\n"
+        "   V9: Fibonacci · V10: RSI extremo\n"
         "🤖 <b>8 agentes con SCORE PONDERADO</b>\n"
-        "   🎯 Filtro de coherencia + volatilidad\n"
-        "   ✅ Confirmación temporal (2 cuotas)\n"
-        f"📈 <b>Estado Actual</b>\n"
+        f" <b>Estado Actual</b>\n"
         f"   Historial: {len(history)} cuotas\n"
-        f"   Favorable: {'✅' if stats['favorable'] else '❌'}\n"
+        f"   Favorable: {'✅' if stats['favorable'] else ''}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
@@ -1601,11 +1811,11 @@ async def cmd_stats(message):
         f"📊 <b>ESTADÍSTICAS — {hora}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 Historial: <code>{stats['total']}</code> cuotas\n"
-        f"🔵 &lt;2x: {stats['below2']} ({stats['pct_below2']:.1f}%)\n"
+        f"🔵 <2x: {stats['below2']} ({stats['pct_below2']:.1f}%)\n"
         f"🟡 2-5x: {stats['two_to_five']} ({stats['pct_2to5']:.1f}%)\n"
         f"📈 Tendencia: {'🟢 FAVORABLE' if stats['favorable'] else '🔴 DESFAVORABLE'}\n"
         f"📡 Señal: <code>{sig_txt}</code>\n"
-        f"✅ Wins: {daily_wins} | ❌ Losses: {daily_losses} | 💎 {pct:.1f}%\n"
+        f"✅ Wins: {daily_wins} |  Losses: {daily_losses} | 💎 {pct:.1f}%\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
@@ -1613,7 +1823,7 @@ async def cmd_stats(message):
 async def cmd_patrones(message):
     await bot.reply_to(message, build_pattern_stats_msg(), parse_mode='HTML')
 
-# ─── LOOPS ────────────────────────────────────────────────────────────────────
+# ── LOOPS ────────────────────────────────────────────────────────────────────
 async def self_ping_loop():
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
     if not render_url:
@@ -1637,7 +1847,7 @@ async def daily_reset_loop():
         meses   = ["Enero","Febrero","Marzo","Abril","Mayo","Junio",
                    "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
         dia_str = f"{now.day} de {meses[now.month - 1]} {now.year}"
-        await send_msg(f"🤑 <b>Resultados del {dia_str}</b>\n" + build_stats_msg())
+        await send_msg(f" <b>Resultados del {dia_str}</b>\n" + build_stats_msg())
         daily_wins = daily_losses = consecutive_wins = consecutive_losses = 0
         save_state()
         logger.info("🔄 Estadísticas reiniciadas — 00:00 Colombia")
@@ -1646,7 +1856,7 @@ async def daily_reset_loop():
 async def main_async():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
-    logger.info("🤖 Iniciando SPACEMAN Bot v14 — agentes optimizados anti-ruido...")
+    logger.info("🤖 Iniciando SPACEMAN Bot v15 — 10 patrones optimizados para 1.8x...")
     db_init()
     load_state()
     load_ml_model()
@@ -1734,7 +1944,7 @@ def run_train_cli(argv: List[str]):
     print(f"📥 Leyendo pattern_stats desde '{args.db}'...")
     df = cargar_datos_entrenamiento(args.db)
     if len(df) < args.min_rows:
-        sys.exit(f"❌ Solo {len(df)} señales (mínimo {args.min_rows}).")
+        sys.exit(f" Solo {len(df)} señales (mínimo {args.min_rows}).")
     print(f"   {len(df)} señales resueltas.")
     print(df["_target"].value_counts().rename({1: "win", 0: "loss"}).to_string())
     print()
