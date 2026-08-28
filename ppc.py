@@ -1836,11 +1836,16 @@ async def resolve_pending(value: float):
 async def resolve_active(value: float):
     global sig_state, sig_attempt, sig_last_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
     global daily_wins, daily_losses, consecutive_wins, consecutive_losses
-    global sig_context_json, sig_signal_id
+    global sig_context_json, sig_signal_id, sig_emit_attempt
     win = value >= CASHOUT_TRIGGER
     label = sig_tipo or "Señal HTML"
     key = sig_tipo_key or "desconocido"
     intento = sig_attempt
+    # Intento relativo: cuántas jugadas van desde que la señal se envió al
+    # canal de Telegram (sig_emit_attempt), no el contador absoluto. Si la
+    # señal se emitió en el intento 2 y se gana ahí mismo, es la 1ª jugada
+    # tras el envío -> "WIN 1 EXP.", no "WIN 2.".
+    intento_relativo = max(1, intento - sig_emit_attempt + 1)
     
     if sig_signal_id and sig_context_json:
         attempt_when_win = intento if win else None
@@ -1854,7 +1859,7 @@ async def resolve_active(value: float):
         consecutive_wins += 1
         consecutive_losses = 0
         await send_signal_msg(build_win_msg(value, label, intento))
-        await send_stats_msg(build_stats_result_msg(value, label, intento, win=True))
+        await send_stats_msg(build_stats_result_msg(value, label, intento_relativo, win=True))
         sig_state = "idle"
         sig_attempt = 0
         sig_msg_id = None
@@ -1880,7 +1885,7 @@ async def resolve_active(value: float):
             consecutive_wins = 0
             consecutive_losses = 0
         await send_signal_msg(build_loss_msg(value, label, intento))
-        await send_stats_msg(build_stats_result_msg(value, label, intento, win=False))
+        await send_stats_msg(build_stats_result_msg(value, label, intento_relativo, win=False))
         sig_state = "idle"
         sig_attempt = 0
         sig_msg_id = None
