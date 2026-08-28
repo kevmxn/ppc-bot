@@ -7,7 +7,8 @@ Estrategia: 3 patrones optimizados para 86-90% de efectividad:
 • PATRÓN V2 💎 (combo_verde_agresiva): combo verde + umbral 4.0x + filtros
 • PATRÓN V3 💎 (martillo): rebote martillo + filtros de profundidad
 + Sistema de 8 agentes como FILTRO INTERNO (no emiten señales propias)
-+ Emisión inmediata cuando tendencia es CLARAMENTE ALCISTA FUERTE (V2)
++ Emisión inmediata propia para V2: pico agresivo reciente más alto +
+  EMA4 sobre EMA8 con margen + RSI en zona alcista (sin exigir tendencia madura)
 + Emisión inmediata propia para V1: racha de cuotas bajas profunda +
   EMA8 girando al alza en 3 lecturas + RSI en sobreventa
 + Emisión inmediata propia para V3: valle más profundo + rebote fuerte +
@@ -136,6 +137,19 @@ VALLE_MIN_INMEDIATA_V3   = 1.20  # valle más profundo que el mínimo base (< 1.
 REBOTE_MIN_INMEDIATA_V3  = 1.5   # la cuota actual debe ser >= 50% superior al valle
 RSI_RECUP_MIN_V3         = 30    # RSI saliendo de sobreventa (recuperación, no aún maduro)
 RSI_RECUP_MAX_V3         = 45
+
+# Emisión inmediata propia de V2 (combo_verde_agresiva): la tendencia VERDE
+# de Lucky que dispara V2 puede activarse con un simple rebote de 2 rondas
+# (calcular_tendencia_lucky), no necesariamente una tendencia consolidada --
+# exigirle encima la alineación madura de es_tendencia_claramente_alcista_
+# fuerte() (EMA4>EMA8>EMA20 ya alineadas y subiendo) es más estricto que la
+# propia base de V2, y en la práctica casi nunca se cumple a la vez. Se usa
+# en cambio un criterio propio, sin depender de una "tendencia alta":
+AGRESIVO_MIN_INMEDIATA_V2      = 6.0  # pico reciente más alto que el mínimo base (4.0x)
+MARGEN_EMA4_EMA8_INMEDIATA_V2  = 0.5  # EMA4 por encima de EMA8 con margen claro, no un cruce apenas iniciado
+ALTAS_MIN_INMEDIATA_V2         = 3    # cuotas >=2.0x entre las últimas 5 (vs mínimo base de 2)
+RSI_MIN_INMEDIATA_V2           = 50   # zona alcista
+RSI_MAX_INMEDIATA_V2           = 70   # sin llegar a sobrecompra
 
 ALERT_LABELS = {
     'video':                'PATRON V1 💎',
@@ -711,6 +725,37 @@ def es_v3_martillo_alta_confianza(vals: List[float], ema8: List[float], rsi: Opt
         return False
     return True
 
+def es_v2_combo_alta_confianza(vals: List[float], ema4: List[float], ema8: List[float],
+                                rsi: Optional[List[float]]) -> bool:
+    """Criterio de emisión inmediata específico para V2 (combo_verde_agresiva),
+    sin depender de una "tendencia alta" madura. La tendencia VERDE de Lucky
+    que dispara V2 puede activarse con un simple rebote de 2 rondas
+    (calcular_tendencia_lucky), no necesariamente EMA4>EMA8>EMA20 alineadas y
+    subiendo -- por eso, en vez de es_tendencia_claramente_alcista_fuerte(),
+    se usa un criterio propio, más exigente que el mínimo de filtro_v2_combo():
+      • Pico agresivo reciente más alto que el mínimo base (>= 6.0x, vs 4.0x)
+      • EMA4 por encima de EMA8 con margen claro (no un cruce apenas iniciado)
+      • Más cuotas altas recientes que el mínimo base (>= 3 de las últimas 5)
+      • RSI en zona alcista sin llegar a sobrecompra (50-70)
+    """
+    if len(vals) < 5 or not ema4 or not ema8:
+        return False
+    ventana = vals[-10:] if len(vals) >= 10 else vals
+    max_rec = max(ventana)
+    if max_rec < AGRESIVO_MIN_INMEDIATA_V2:
+        return False
+    if (ema4[-1] - ema8[-1]) < MARGEN_EMA4_EMA8_INMEDIATA_V2:
+        return False
+    ultimos_5 = vals[-5:]
+    if sum(1 for v in ultimos_5 if v >= 2.0) < ALTAS_MIN_INMEDIATA_V2:
+        return False
+    if not rsi or len(rsi) == 0:
+        return False
+    r = rsi[-1]
+    if not (RSI_MIN_INMEDIATA_V2 <= r <= RSI_MAX_INMEDIATA_V2):
+        return False
+    return True
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PATRONES BASE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1247,15 +1292,14 @@ class HtmlEngine:
                     features['emision_inmediata_v3'] = True
                     motivo += f' | 🚀 INMEDIATA (V3: valle<{VALLE_MIN_INMEDIATA_V3}, rebote≥{REBOTE_MIN_INMEDIATA_V3}x, EMA8×4, RSI {RSI_RECUP_MIN_V3}-{RSI_RECUP_MAX_V3})'
                     logger.info(f"[v17] 🚀 Emisión inmediata V3 activada: valle<{VALLE_MIN_INMEDIATA_V3}, rebote≥{REBOTE_MIN_INMEDIATA_V3}x, RSI {RSI_RECUP_MIN_V3}-{RSI_RECUP_MAX_V3}")
-        elif es_tendencia_claramente_alcista_fuerte(vals, ema4, ema8, ema20, rsi, nuevo):
-            opc_cumplidas = cumple_condiciones_opcionales_inmediata(vals, macd)
-            if opc_cumplidas >= 2:
+        elif tipo_key == 'combo_verde_agresiva':
+            if es_v2_combo_alta_confianza(vals, ema4, ema8, rsi):
                 if agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_score):
                     es_inmediata = True
                     features['emision_inmediata'] = True
-                    features['opc_cumplidas'] = opc_cumplidas
-                    motivo += f' | 🚀 INMEDIATA (opc={opc_cumplidas}/3)'
-                    logger.info(f"[v17] 🚀 Emisión inmediata activada: {tipo_key} | opc={opc_cumplidas}/3")
+                    features['emision_inmediata_v2'] = True
+                    motivo += f' | 🚀 INMEDIATA (V2: pico≥{AGRESIVO_MIN_INMEDIATA_V2}x, EMA4-EMA8≥{MARGEN_EMA4_EMA8_INMEDIATA_V2}, RSI {RSI_MIN_INMEDIATA_V2}-{RSI_MAX_INMEDIATA_V2})'
+                    logger.info(f"[v17] 🚀 Emisión inmediata V2 activada: pico≥{AGRESIVO_MIN_INMEDIATA_V2}x, RSI {RSI_MIN_INMEDIATA_V2}-{RSI_MAX_INMEDIATA_V2}")
         
         return tipo_key, label, motivo, json.dumps(features, default=str), es_inmediata
     
@@ -1758,7 +1802,7 @@ async def send_stats_update():
         return
     if stats_msg_id:
         await delete_msg(stats_msg_id)
-    stats_msg_id = await send_stats_msg(build_stats_msg())
+    stats_msg_id = await send_signal_msg(build_stats_msg())
     save_state()
 
 # ─── MÁQUINA DE ESTADOS ──────────────────────────────────────────────────────
