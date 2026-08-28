@@ -1828,7 +1828,10 @@ async def resolve_pending(value: float):
         logger.info(f"[v17] 🔎 Intento 1 falló ({value:.2f}x) — señal activa para intento {sig_emit_attempt} | {label}")
         sig_state = "active"
         sig_attempt = sig_emit_attempt
-        sig_last_attempt = MAX_ATTEMPTS_NORMAL
+        # La señal, una vez enviada al canal, tiene sólo 2 intentos (el de
+        # emisión + 1 más) — igual que las señales inmediatas. El tope debe
+        # ser relativo al intento de emisión, no un absoluto fijo en 4.
+        sig_last_attempt = sig_emit_attempt + 1
         text = build_signal_msg(label, value, es_inmediata=False, emit_attempt=sig_emit_attempt)
         sig_msg_id = await send_signal_msg(text, no_preview=True)
         save_state()
