@@ -7,7 +7,11 @@ Estrategia: 3 patrones optimizados para 86-90% de efectividad:
 • PATRÓN V2 💎 (combo_verde_agresiva): combo verde + umbral 4.0x + filtros
 • PATRÓN V3 💎 (martillo): rebote martillo + filtros de profundidad
 + Sistema de 8 agentes como FILTRO INTERNO (no emiten señales propias)
-+ Emisión inmediata cuando tendencia es CLARAMENTE ALCISTA FUERTE
++ Emisión inmediata cuando tendencia es CLARAMENTE ALCISTA FUERTE (V2)
++ Emisión inmediata propia para V1: racha de cuotas bajas profunda +
+  EMA8 girando al alza en 3 lecturas + RSI en sobreventa
++ Emisión inmediata propia para V3: valle más profundo + rebote fuerte +
+  EMA8 girando al alza en 4 lecturas + RSI en recuperación
 + 🆕 ML DE TIMING DINÁMICO: ajusta automáticamente en qué intento (1, 2, 3, 4)
   se dispara la señal al Telegram según:
   • Contexto en tiempo real (últimas 20 rondas + features de la señal)
@@ -50,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 # ─── CONFIG — TELEGRAM ────────────────────────────────────────────────────────
 BOT_TOKEN  = os.environ.get("BOT_TOKEN",  "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo")
-CHAT_ID_BASE = int(os.environ.get("CHAT_ID_BASE", "3965615775"))
+CHAT_ID_BASE = int(os.environ.get("CHAT_ID_BASE", "-1003965615775"))
 THREAD_SIGNALS = int(os.environ.get("THREAD_SIGNALS", "2"))
 THREAD_STATS   = int(os.environ.get("THREAD_STATS",   "5"))
 
@@ -114,6 +118,24 @@ SOPORTE_COOLDOWN       = 5
 MIN_DATOS_ENTRE_TOQUES = 2
 TOQUES_NECESARIOS      = 3
 RANGO_KEYS = ['muyBajo', 'bajo', 'medio', 'medioAlto', 'alto']
+
+# Emisión inmediata propia de V1 (video): a diferencia de V2/V3, que exigen
+# tendencia alcista con la última cuota ya alta, V1 opera en sentido
+# contrario -- racha de cuotas bajas + rebote naciente. Se necesita, entonces,
+# un criterio de "alta confianza" adaptado a ese contexto, más exigente que
+# el mínimo de filtro_v1_video() (racha de 3 bajas).
+RACHA_BAJOS_MIN_INMEDIATA_V1 = 5     # racha de cuotas <2.0x más profunda que el mínimo base (3)
+RSI_OVERSOLD_V1               = 35   # RSI en sobreventa clara, refuerza probabilidad de rebote
+
+# Emisión inmediata propia de V3 (martillo): igual que V1, el martillo es un
+# patrón de rebote desde un valle -- exigirle la tendencia madura y sostenida
+# de es_tendencia_claramente_alcista_fuerte() (EMA4>EMA8>EMA20 ya alineadas y
+# subiendo) es poco realista justo en el momento del giro. Se usa en cambio
+# un criterio propio, más exigente que el mínimo de filtro_v3_martillo():
+VALLE_MIN_INMEDIATA_V3   = 1.20  # valle más profundo que el mínimo base (< 1.5)
+REBOTE_MIN_INMEDIATA_V3  = 1.5   # la cuota actual debe ser >= 50% superior al valle
+RSI_RECUP_MIN_V3         = 30    # RSI saliendo de sobreventa (recuperación, no aún maduro)
+RSI_RECUP_MAX_V3         = 45
 
 ALERT_LABELS = {
     'video':                'PATRON V1 💎',
@@ -417,7 +439,7 @@ async def send_msg(text: str, no_preview: bool = False,
         msg = await bot.send_message(**kwargs)
         return msg.message_id
     except Exception as e:
-        logger.warning(f"[v17] send error: {e}")
+        logger.warning(f"[v17] send error (chat_id={CHAT_ID_BASE}, thread_id={thread_id}): {e}")
         return None
 
 async def send_signal_msg(text: str, no_preview: bool = False) -> Optional[int]:
@@ -627,6 +649,65 @@ def agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_sco
     if risk_score >= 7:
         return False
     if contar_no_entrar >= 4 and contar_no_entrar > contar_entrar:
+        return False
+    return True
+
+def es_v1_video_alta_confianza(vals: List[float], ema8: List[float], rsi: Optional[List[float]]) -> bool:
+    """Criterio de emisión inmediata específico para V1 (video).
+    es_tendencia_claramente_alcista_fuerte() es estructuralmente incompatible
+    con V1: exige vals[-1] >= 2.0, mientras que filtro_v1_video() exige que
+    las últimas 3 cuotas sean < 2.0 -- por diseño nunca coinciden. V1 necesita
+    entonces su propio criterio de "alta confianza", pensado para el mismo
+    contexto en el que V1 dispara (racha de cuotas bajas + EMA8 girando al
+    alza), pero más exigente que el mínimo del patrón base:
+      • Racha de cuotas < 2.0x más profunda (>= 5, vs el mínimo de 3 de V1)
+      • EMA8 confirmando el giro en 3 lecturas seguidas, no solo la última
+      • RSI en sobreventa clara (refuerza que el rebote es probable)
+    """
+    if len(vals) < 5 or len(ema8) < 3:
+        return False
+    racha_bajos = 0
+    i = len(vals) - 1
+    while i >= 0 and vals[i] < 2.0:
+        racha_bajos += 1
+        i -= 1
+    if racha_bajos < RACHA_BAJOS_MIN_INMEDIATA_V1:
+        return False
+    if not (ema8[-1] > ema8[-2] > ema8[-3]):
+        return False
+    if not rsi or len(rsi) == 0:
+        return False
+    if rsi[-1] > RSI_OVERSOLD_V1:
+        return False
+    return True
+
+def es_v3_martillo_alta_confianza(vals: List[float], ema8: List[float], rsi: Optional[List[float]]) -> bool:
+    """Criterio de emisión inmediata específico para V3 (martillo).
+    Igual que V1, el martillo es un patrón de rebote desde un valle -- pedirle
+    la tendencia madura y sostenida de es_tendencia_claramente_alcista_fuerte()
+    (EMA4>EMA8>EMA20 ya alineadas y subiendo) es poco realista justo en el
+    momento del giro: esa condición describe una tendencia ya consolidada, no
+    un rebote recién iniciado. V3 necesita entonces su propio criterio de
+    "alta confianza", más exigente que el mínimo de filtro_v3_martillo():
+      • Valle más profundo que el mínimo base (< 1.20, vs el mínimo de 1.5)
+      • Rebote fuerte: la cuota actual >= 50% por encima del valle
+      • EMA8 confirmando el giro en 4 lecturas seguidas (una más que la base)
+      • RSI saliendo de sobreventa (recuperación, no aún neutral/maduro)
+    """
+    if len(vals) < 6 or len(ema8) < 4:
+        return False
+    valle = vals[-2]
+    if valle <= 0 or valle >= VALLE_MIN_INMEDIATA_V3:
+        return False
+    rebote_ratio = vals[-1] / valle
+    if rebote_ratio < REBOTE_MIN_INMEDIATA_V3:
+        return False
+    if not (ema8[-1] > ema8[-2] > ema8[-3] > ema8[-4]):
+        return False
+    if not rsi or len(rsi) == 0:
+        return False
+    r = rsi[-1]
+    if not (RSI_RECUP_MIN_V3 <= r <= RSI_RECUP_MAX_V3):
         return False
     return True
 
@@ -1150,7 +1231,23 @@ class HtmlEngine:
         tipo_key, label, motivo, features = elegido
         
         es_inmediata = False
-        if es_tendencia_claramente_alcista_fuerte(vals, ema4, ema8, ema20, rsi, nuevo):
+        if tipo_key == 'video':
+            if es_v1_video_alta_confianza(vals, ema8, rsi):
+                if agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_score):
+                    es_inmediata = True
+                    features['emision_inmediata'] = True
+                    features['emision_inmediata_v1'] = True
+                    motivo += f' | 🚀 INMEDIATA (V1: racha≥{RACHA_BAJOS_MIN_INMEDIATA_V1}, EMA8×3, RSI≤{RSI_OVERSOLD_V1})'
+                    logger.info(f"[v17] 🚀 Emisión inmediata V1 activada: racha_bajos≥{RACHA_BAJOS_MIN_INMEDIATA_V1}, RSI≤{RSI_OVERSOLD_V1}")
+        elif tipo_key == 'martillo':
+            if es_v3_martillo_alta_confianza(vals, ema8, rsi):
+                if agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_score):
+                    es_inmediata = True
+                    features['emision_inmediata'] = True
+                    features['emision_inmediata_v3'] = True
+                    motivo += f' | 🚀 INMEDIATA (V3: valle<{VALLE_MIN_INMEDIATA_V3}, rebote≥{REBOTE_MIN_INMEDIATA_V3}x, EMA8×4, RSI {RSI_RECUP_MIN_V3}-{RSI_RECUP_MAX_V3})'
+                    logger.info(f"[v17] 🚀 Emisión inmediata V3 activada: valle<{VALLE_MIN_INMEDIATA_V3}, rebote≥{REBOTE_MIN_INMEDIATA_V3}x, RSI {RSI_RECUP_MIN_V3}-{RSI_RECUP_MAX_V3}")
+        elif es_tendencia_claramente_alcista_fuerte(vals, ema4, ema8, ema20, rsi, nuevo):
             opc_cumplidas = cumple_condiciones_opcionales_inmediata(vals, macd)
             if opc_cumplidas >= 2:
                 if agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_score):
@@ -1887,6 +1984,26 @@ def ping():
     return 'pong', 200
 
 # ─── TELEGRAM COMMANDS ─────────────────────────────────────────────────────────
+@bot.message_handler(commands=['chatid'])
+async def cmd_chatid(message):
+    """Diagnóstico para el error 'chat not found' en temas (topics):
+    responder este comando DENTRO de cada tema (hilo) del grupo para ver el
+    chat_id y message_thread_id reales que hay que poner en las variables de
+    entorno CHAT_ID_BASE, THREAD_SIGNALS y THREAD_STATS."""
+    thread = getattr(message, "message_thread_id", None)
+    is_topic = getattr(message, "is_topic_message", False)
+    await bot.reply_to(message,
+        "🆔 <b>Datos de este chat/tema</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"chat_id: <code>{message.chat.id}</code>\n"
+        f"message_thread_id: <code>{thread}</code>\n"
+        f"es_tema (topic): {is_topic}\n\n"
+        f"Configurado ahora: CHAT_ID_BASE=<code>{CHAT_ID_BASE}</code> · "
+        f"THREAD_SIGNALS=<code>{THREAD_SIGNALS}</code> · THREAD_STATS=<code>{THREAD_STATS}</code>\n\n"
+        "<i>Si chat_id no coincide con CHAT_ID_BASE, ese es el problema del "
+        "error 'chat not found'.</i>",
+        parse_mode='HTML')
+
 @bot.message_handler(commands=['start'])
 async def cmd_start(message):
     name  = message.from_user.first_name or "usuario"
@@ -1985,7 +2102,16 @@ async def main_async():
         types.BotCommand('start', '🤖 Información del bot'),
         types.BotCommand('stats', '📊 Estadísticas'),
         types.BotCommand('patrones', '📈 Efectividad por patrón (24h)'),
+        types.BotCommand('chatid', '🆔 Ver chat_id / thread_id de este tema'),
     ])
+    if CHAT_ID_BASE > 0:
+        logger.warning(
+            f"[v17] ⚠️ CHAT_ID_BASE={CHAT_ID_BASE} es positivo. Los grupos/"
+            "supergrupos con temas (topics) usan chat_id NEGATIVO, típicamente "
+            "con prefijo -100 (ej: -1003965615775). Si los envíos fallan con "
+            "'chat not found', usá /chatid dentro del grupo para obtener el "
+            "valor correcto y actualizar la variable de entorno."
+        )
     asyncio.create_task(ws_loop())
     asyncio.create_task(self_ping_loop())
     asyncio.create_task(daily_reset_loop())
