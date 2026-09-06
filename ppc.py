@@ -21,6 +21,7 @@ SPACEMAN HTML Strategy Bot — Telegram + Render  [v22 — Señales del gráfico
   la probabilidad de éxito en los últimos intentos.
 """
 import asyncio
+import time
 import sqlite3
 import sys
 import threading
@@ -1552,22 +1553,34 @@ async def process_new_value(value: float, silent: bool = False):
     await emit_signal(value, tipo_key, label, motivo, features_json, confirmada_por_espera=False)
 
 # ─── CONEXIÓN WEBSOCKET — Pragmatic Play (Spaceman) ──────────────────────────
-# Conexión en tiempo real (igual que spaceman_telegram.py): cada mensaje
-# "gameResult" del WebSocket representa una ronda ya jugada. A diferencia del
-# polling HTTP de Aviator (que debía deduplicar comparando un historial
-# completo devuelto en cada request), acá el problema es otro: el código
-# anterior descartaba una ronda nueva cuando su cuota coincidía con la
-# anterior (`val == last_result`), tratando por error dos rondas distintas
-# con la misma cuota como si fueran la misma ronda repetida. La corrección
-# es identificar cada ronda por su propio identificador (roundId/gameId/id/
-# timestamp que envía Pragmatic Play), NUNCA por el valor de la cuota — así,
-# cuotas repetidas en rondas diferentes se toman siempre como nuevas.
+# Estructura real confirmada en VB.html (script oficial del panel): cada
+# mensaje trae `data.gameResult`, y el HTML de referencia SOLO lee
+# `gameResult[0].result` — no hay ningún id de ronda ni timestamp por ítem
+# en el payload, es la única fuente confiable. Hubo dos versiones previas
+# de este bloque con bugs opuestos:
+#  v1: deduplicaba SOLO por valor de cuota (`val == last_result`) → dos
+#      rondas distintas con la misma cuota se fusionaban en una sola.
+#  v2: deduplicaba por un campo "id"/"timestamp" adivinado que no existe en
+#      el payload real → sin ese campo, el fallback trataba cada mensaje
+#      como distinto y la MISMA ronda se contaba como varias rondas nuevas.
+# Fix definitivo (alineado a VB.html): se toma solo gameResult[0], igual que
+# el HTML oficial, y se combina valor + una ventana mínima de tiempo real
+# entre rondas: un mensaje con la MISMA cuota que la última procesada solo
+# se acepta como ronda nueva si pasó al menos ROUND_MIN_GAP_SEC segundos
+# desde la última — menos que eso es, con altísima probabilidad, el mismo
+# resultado reenviado (heartbeat/reconexión), no una ronda distinta.
+ROUND_MIN_GAP_SEC = float(os.environ.get("ROUND_MIN_GAP_SEC", "3.0"))
+
+# Log temporal para confirmar con tráfico real cuántas rondas trae cada
+# mensaje "gameResult" de Pragmatic. Activar con DEBUG_WS_PAYLOAD=1 en el
+# entorno, mirar los logs un rato, y después desactivarlo (o dejarlo en 0,
+# que es el valor por defecto) para no ensuciar el log en producción.
+DEBUG_WS_PAYLOAD = os.environ.get("DEBUG_WS_PAYLOAD", "0") == "1"
+
 ws_conn_status = "disconnected"   # disconnected | connecting | connected | error
 ws_conn_detail  = ""
-last_round_signature: Optional[str] = None
-
-_ROUND_ID_KEYS = ('roundId', 'gameId', 'matchId', 'externalGameId', 'gameID', 'id')
-_TIME_ID_KEYS  = ('collectedAt', 'timestamp', 'createdAt', 'time')
+last_round_value: Optional[float] = None
+last_round_time: Optional[float] = None
 
 def set_ws_status(state: str, detail: str = ""):
     global ws_conn_status, ws_conn_detail
@@ -1575,31 +1588,28 @@ def set_ws_status(state: str, detail: str = ""):
     ws_conn_detail = detail
 
 def _get_val(item: dict) -> Optional[float]:
+    # "result" es el campo real (VB.html: firstResult.result). multiplier/
+    # crashPoint quedan como fallback defensivo por si la fuente cambia.
     v = item.get("result") or item.get("multiplier") or item.get("crashPoint")
     try:
         return float(v) if v is not None else None
     except (TypeError, ValueError):
         return None
 
-def _get_round_signature(item: dict, val: float) -> str:
-    """Firma única por ronda. Prioriza un identificador real de ronda
-    (roundId/gameId/id/...); si no viene ninguno, usa una marca de tiempo:
-    en NINGÚN caso se usa solo el valor de la cuota, que es justamente lo
-    que causaba que rondas distintas con la misma cuota se consideraran
-    duplicadas."""
-    for k in _ROUND_ID_KEYS:
-        if item.get(k) not in (None, ""):
-            return f"id:{item[k]}"
-    for k in _TIME_ID_KEYS:
-        if item.get(k) not in (None, ""):
-            return f"t:{item[k]}|v:{val:.4f}"
-    # Sin id ni timestamp en el payload: se usa el contenido completo del
-    # item (no solo la cuota) para no perder rondas legítimas que repiten
-    # la misma cuota de forma consecutiva.
-    return f"raw:{json.dumps(item, sort_keys=True, default=str)}"
+def _is_new_round(val: float, now: float) -> bool:
+    """True si `val` corresponde a una ronda distinta de la última procesada.
+    Cuota distinta -> siempre ronda nueva. Cuota igual -> solo se acepta como
+    ronda nueva si pasó suficiente tiempo real (ROUND_MIN_GAP_SEC) desde la
+    anterior; si no, se asume que es el mismo resultado reenviado."""
+    global last_round_value, last_round_time
+    if last_round_value is None:
+        return True
+    if val != last_round_value:
+        return True
+    return (now - last_round_time) >= ROUND_MIN_GAP_SEC
 
 async def ws_loop():
-    global last_round_signature
+    global last_round_value, last_round_time
     RECONNECT_DELAY = 5
     set_ws_status("connecting", "🟡 CONECTANDO...")
     while True:
@@ -1620,19 +1630,22 @@ async def ws_loop():
                     game_results = data.get("gameResult", [])
                     if not game_results:
                         continue
-                    # Se procesan TODAS las rondas del mensaje, en orden, no
-                    # solo la última — así no se pierden rondas si llega más
-                    # de una junta (p. ej. tras una reconexión breve).
-                    for item in game_results:
-                        val = _get_val(item)
-                        if val is None:
-                            continue
-                        sig = _get_round_signature(item, val)
-                        if sig == last_round_signature:
-                            continue
-                        last_round_signature = sig
-                        set_ws_status("connected", f"🟢 CONECTADO — nueva ronda: {val:.2f}x")
-                        await process_new_value(val, silent=False)
+                    if DEBUG_WS_PAYLOAD:
+                        logger.info(
+                            f"[DEBUG_WS] gameResult trae {len(game_results)} elemento(s) | "
+                            f"contenido: {json.dumps(game_results, default=str)}"
+                        )
+                    # Igual que VB.html: se toma solo gameResult[0] (la
+                    # ronda actual que reporta el panel oficial).
+                    item = game_results[0]
+                    val = _get_val(item)
+                    if val is not None:
+                        now = time.monotonic()
+                        if _is_new_round(val, now):
+                            last_round_value = val
+                            last_round_time = now
+                            set_ws_status("connected", f"🟢 CONECTADO — nueva ronda: {val:.2f}x")
+                            await process_new_value(val, silent=False)
                     try:
                         await check_timing_predictions()
                     except Exception as e:
