@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 """
-SPACEMAN HTML Strategy Bot — Telegram + Render  [v17 — ML Timing Dinámico]
+SPACEMAN HTML Strategy Bot — Telegram + Render  [v22 — Señales del gráfico de tendencia]
 ────────────────────────────────────────────────────────────────────────────
-Estrategia: 3 patrones optimizados para 86-90% de efectividad:
-• PATRÓN V1 💎 (video): zona de confianza 30-40% + filtros de sobreventa
-• PATRÓN V2 💎 (combo_verde_agresiva): combo verde + umbral 4.0x + filtros
-• PATRÓN V3 💎 (martillo): rebote martillo + filtros de profundidad
-+ Sistema de 8 agentes como FILTRO INTERNO (no emiten señales propias)
-+ Emisión inmediata propia para V2: pico agresivo reciente más alto +
-  EMA4 sobre EMA8 con margen + RSI en zona alcista (sin exigir tendencia madura)
-+ Emisión inmediata propia para V1: racha de cuotas bajas profunda +
-  EMA8 girando al alza en 3 lecturas + RSI en sobreventa
-+ Emisión inmediata propia para V3: valle más profundo + rebote fuerte +
-  EMA8 girando al alza en 4 lecturas + RSI en recuperación
-+ 🆕 ML DE TIMING DINÁMICO: ajusta automáticamente en qué intento (1, 2, 3, 4)
-  se dispara la señal al Telegram según:
-  • Contexto en tiempo real (últimas 20 rondas + features de la señal)
-  • Análisis de todas las señales aprendidas históricamente
-  • La ronda se desplaza según el contexto: a veces conviene intento 1,
-    a veces 2, a veces 3, a veces 4
-Mecánica de confirmación: intento 1 silencioso a 1.60x. Si falla, se envía
-señal para intento 2, 3 y 4 (gana si cualquiera >= 1.80x).
-Emisión inmediata: 2 intentos directos sin confirmación previa.
-Telegram: señales en tema 2, estadísticas en tema 5 del grupo base.
+- Señal única de entrada: gráfico de tendencia (posiciones ≥2x/<2x + EMA4/8/20,
+  réplica exacta de drawTrend()/calculateEMAForTrend() del panel HTML)
+- Líneas calientes ≥5x (amarilla) y ≥10x (morada): no disparan por sí solas,
+  se registran cada ronda y se anexan como feature de ML a la señal de tendencia
+- Señal de tiempo "rebote 3x-5x": predictor de horario (réplica de
+  calcularPrediccionInteligente()/checkAutoPredictions()) que dispara señal
+  de entrada al llegar el horario previsto
+- Objetivo de retiro SIEMPRE 2.00x; se registra además si la ronda llegó a 4x
+  (supero_4x) para entrenar el modelo con esa distinción
+- Sesión de hasta 5 señales: se gana y CORTA apenas acierta una. Solo se
+  pierde si las 5 fallan seguidas
+- Fuente: Spaceman — Pragmatic Play (WebSocket en tiempo real)
+- MODIFICACIÓN: Se eliminó el bloqueo por tendencia general desfavorable
+  para las señales de tiempo (check_timing_round_trigger y emit_timing_signal)
+- NUEVO: Acumulación de fuerza por fallos en señales de tiempo. Cada fallo
+  reduce la ventana de anticipación y amplía la ventana posterior, aumentando
+  la probabilidad de éxito en los últimos intentos.
 """
 import asyncio
 import sqlite3
@@ -31,13 +27,14 @@ import threading
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 from flask import Flask, request
+import aiohttp
 import websockets
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
-import aiohttp
+
 # ─── ML — dependencias opcionales ──
 try:
     import joblib
@@ -53,25 +50,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── CONFIG — TELEGRAM ────────────────────────────────────────────────────────
+# ─── CONFIG — TELEGRAM ─────────────────────────────────────────────────────────
 BOT_TOKEN  = os.environ.get("BOT_TOKEN",  "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo")
-CHAT_ID_BASE = int(os.environ.get("CHAT_ID_BASE", "-1003965615775"))
-THREAD_SIGNALS = int(os.environ.get("THREAD_SIGNALS", "2"))
-THREAD_STATS   = int(os.environ.get("THREAD_STATS",   "5"))
+CHAT_ID_BASE = int(os.environ.get("CHAT_ID_BASE", "-1003986868798"))
+THREAD_SIGNALS = int(os.environ.get("THREAD_SIGNALS", "1590"))
+THREAD_STATS   = int(os.environ.get("THREAD_STATS",   "1591"))
 
-# ─── CONFIG — WEBSOCKET ───────────────────────────────────────────────────────
+# ─── CONFIG — WEBSOCKET (Pragmatic Play — Spaceman) ───────────────────────────
 WS_URL    = os.environ.get("WS_URL",    "wss://dga.pragmaticplaylive.net/ws")
 CASINO_ID = os.environ.get("CASINO_ID", "ppcdk00000005349")
 CURRENCY  = os.environ.get("CURRENCY",  "BRL")
 GAME_ID   = int(os.environ.get("GAME_ID", "1301"))
+
 DB_FILE = os.environ.get("DB_FILE", "spaceman.db")
+ARG_TZ = timezone(timedelta(hours=-3))
 
 # ─── CONFIG — ML ──────────────────────────────────────────────────────────────
 MODEL_FILE     = os.environ.get("MODEL_FILE", "signal_model.joblib")
-MODEL_MIN_PROB = float(os.environ.get("MODEL_MIN_PROB", "0.55"))
+MODEL_MIN_PROB = float(os.environ.get("MODEL_MIN_PROB", "0.40"))
+
+# Umbrales del gráfico de tendencia (posiciones +1/-1 según ≥2x, igual que
+# drawTrend() del panel HTML) — reemplaza a los antiguos patrones de score.
+TREND_MIN_HISTORY      = int(os.environ.get("TREND_MIN_HISTORY", "21"))
+TREND_SIGNAL_SCORE_MIN = float(os.environ.get("TREND_SIGNAL_SCORE_MIN", "75"))
 TIMING_MODEL_FILE = os.environ.get("TIMING_MODEL_FILE", "timing_model.joblib")
-TIMING_MIN_PROB = float(os.environ.get("TIMING_MIN_PROB", "0.40"))
-CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "20"))
+TIMING_MIN_PROB = float(os.environ.get("TIMING_MIN_PROB", "0.35"))
+
+# Líneas calientes ≥5x (amarilla) y ≥10x (morada) — igual que drawHotLines()
+# del panel HTML. No emiten señal propia: se registran cada ronda y se anexan
+# como feature a la señal de tendencia, para que el modelo de ML aprenda su
+# aporte real.
+HOTLINE_THRESHOLD_5X  = float(os.environ.get("HOTLINE_THRESHOLD_5X", "5.00"))
+HOTLINE_THRESHOLD_10X = float(os.environ.get("HOTLINE_THRESHOLD_10X", "10.00"))
+HOTLINE_TOLERANCE     = float(os.environ.get("HOTLINE_TOLERANCE", "0.5"))
+HOTLINE_DECAY_ROUNDS  = int(os.environ.get("HOTLINE_DECAY_ROUNDS", "6"))
+
+# Predictor de tiempo "rebote 3x-5x" — igual que calcularPrediccionInteligente()
+# / checkAutoPredictions() del panel HTML: registra el horario de cada ronda
+# ≥3x, promedia el intervalo entre las últimas y predice el próximo horario.
+# Al llegar ese horario se envía la señal de ENTRADA (el retiro sigue en 2x).
+TIMING_HIGH_THRESHOLD   = float(os.environ.get("TIMING_HIGH_THRESHOLD", "3.00"))
+TIMING_HISTORY_MAX      = int(os.environ.get("TIMING_HISTORY_MAX", "15"))
+TIMING_SAMPLE_WINDOW    = int(os.environ.get("TIMING_SAMPLE_WINDOW", "5"))
+# El horario predicho es el momento estimado en que caerá la próxima ronda
+# 3x-5x (el "rebote"). La señal de ENTRADA SOLO se procesa si una ronda real
+# cae dentro de la franja de 15 a 30 segundos ANTES de ese horario (es decir,
+# una ronda debe caer en esos 15s de ventana). No basta con que el reloj
+# entre en la franja: tiene que llegar una ronda nueva estando dentro de ella.
+TIMING_PREALERT_MIN_SEC = int(os.environ.get("TIMING_PREALERT_MIN_SEC", "15"))
+TIMING_PREALERT_MAX_SEC = int(os.environ.get("TIMING_PREALERT_MAX_SEC", "30"))
+TIMING_ALERT_WINDOW_SEC = int(os.environ.get("TIMING_ALERT_WINDOW_SEC", "10"))
+TIMING_DEDUPE_SEC       = int(os.environ.get("TIMING_DEDUPE_SEC", "15"))
 
 AUTO_TRAIN_ENABLED     = os.environ.get("AUTO_TRAIN_ENABLED", "1") == "1"
 AUTO_TRAIN_MIN_ROWS    = int(os.environ.get("AUTO_TRAIN_MIN_ROWS", "100"))
@@ -84,81 +113,429 @@ def colombia_now() -> datetime:
 def colombia_time() -> str:
     return colombia_now().strftime("%H:%M")
 
-# ─── UMBRALES DE TENDENCIA ──────────
-UMBRAL_BELOW2 = 53.51
-UMBRAL_2TO5   = 26.99
-HISTORY_MAX   = 150
-
-# ─── CUOTA ÚNICA ──────
-CASHOUT_TARGET  = 1.50
-CASHOUT_TRIGGER = 1.50
-CONFIRM_TRIGGER = 2.00
-
-# ─── MECÁNICA DE CONFIRMACIÓN ───────
-MAX_ATTEMPTS_NORMAL    = 4   # v17: hasta 4 intentos
-MAX_ATTEMPTS_IMMEDIATE = 2   # emisión inmediata: intentos 1 y 2
+# ─── UMBRALES ──────────────────────────────────────────────────────────────
+HISTORY_MAX   = 200
+# Objetivo de retiro ÚNICO para TODAS las señales/patrones, sin importar su
+# "objetivo natural" (p.ej. la señal de tiempo apunta conceptualmente a un
+# rebote 3x-5x, las líneas calientes a 5x/10x): el bot siempre indica retirar
+# en 2x, y resolve_active() define "ganada" para el modelo de ML únicamente
+# con value >= CASHOUT_TRIGGER (2x) — nunca con la cuota "propia" del patrón.
+CASHOUT_TARGET  = 2.00
+CASHOUT_TRIGGER = 2.00
+MAX_ATTEMPTS_NORMAL = 1   # solo un intento por señal
 GAME_LINK = "https://1win.lat/casino/play/v_pragmatic:spaceman"
 
+# Umbral de confirmación previa al envío: si al detectar el patrón la última
+# cuota ya fue ≥ este valor, la señal queda pendiente hasta que una ronda
+# posterior resulte < este valor.
+CONFIRM_BELOW = float(os.environ.get("CONFIRM_BELOW", "2.00"))
+
 # ═══════════════════════════════════════════════════════════════════════════
-# CONSTANTES DEL SISTEMA HTML
+# GRÁFICO DE TENDENCIA (posiciones + EMA4/8/20) — réplica exacta de
+# drawTrend()/calculateEMAForTrend() del panel HTML. Esta es ahora la ÚNICA
+# fuente de señales de entrada del bot.
 # ═══════════════════════════════════════════════════════════════════════════
-UMBRAL_ACTIVACION      = 30
-MAX_LUCKY_GALES        = 2
-COOLDOWN_VERDE         = 10
-COOLDOWN_ROJO          = 6
-NIVEL_SOBREVENTA       = -4
-RACHA_SOBREVENTA       = 4
 
-CONF_ALERTA_MIN        = 30
-CONF_ALERTA_MAX        = 40
-UMBRAL_AGRESIVO_V2     = 4.0
-UMBRAL_VALLE_V3        = 1.5
-DIST_MIN_EMA8_V3       = 1.05
-DIST_MAX_EMA8_V3       = 1.50
-SOPORTE_COOLDOWN       = 5
-MIN_DATOS_ENTRE_TOQUES = 2
-TOQUES_NECESARIOS      = 3
-RANGO_KEYS = ['muyBajo', 'bajo', 'medio', 'medioAlto', 'alto']
+def calc_trend_positions(vals: List[float]) -> List[float]:
+    """Igual que el `positions` de drawTrend(): arranca en 0 y suma +1 si la
+    ronda fue ≥2.00x, o resta 1 si fue <2.00x."""
+    if not vals:
+        return []
+    positions = [0.0]
+    current = 0.0
+    for v in vals[1:]:
+        current += 1.0 if v >= 2.00 else -1.0
+        positions.append(current)
+    return positions
 
-# Emisión inmediata propia de V1 (video): a diferencia de V2/V3, que exigen
-# tendencia alcista con la última cuota ya alta, V1 opera en sentido
-# contrario -- racha de cuotas bajas + rebote naciente. Se necesita, entonces,
-# un criterio de "alta confianza" adaptado a ese contexto, más exigente que
-# el mínimo de filtro_v1_video() (racha de 3 bajas).
-RACHA_BAJOS_MIN_INMEDIATA_V1 = 5     # racha de cuotas <2.0x más profunda que el mínimo base (3)
-RSI_OVERSOLD_V1               = 35   # RSI en sobreventa clara, refuerza probabilidad de rebote
+def calc_ema_trend(positions: List[float], period: int) -> List[float]:
+    """Réplica exacta de calculateEMAForTrend(): primer valor = SMA del
+    primer `period`, luego EMA estándar con k = 2/(period+1)."""
+    if len(positions) < period:
+        return []
+    k = 2 / (period + 1)
+    ema_value = sum(positions[:period]) / period
+    ema_result = [ema_value]
+    for i in range(period, len(positions)):
+        ema_value = (positions[i] * k) + (ema_value * (1 - k))
+        ema_result.append(ema_value)
+    return ema_result
 
-# Emisión inmediata propia de V3 (martillo): igual que V1, el martillo es un
-# patrón de rebote desde un valle -- exigirle la tendencia madura y sostenida
-# de es_tendencia_claramente_alcista_fuerte() (EMA4>EMA8>EMA20 ya alineadas y
-# subiendo) es poco realista justo en el momento del giro. Se usa en cambio
-# un criterio propio, más exigente que el mínimo de filtro_v3_martillo():
-VALLE_MIN_INMEDIATA_V3   = 1.20  # valle más profundo que el mínimo base (< 1.5)
-REBOTE_MIN_INMEDIATA_V3  = 1.5   # la cuota actual debe ser >= 50% superior al valle
-RSI_RECUP_MIN_V3         = 30    # RSI saliendo de sobreventa (recuperación, no aún maduro)
-RSI_RECUP_MAX_V3         = 45
+def _ema_at(ema_list: List[float], period: int, data_index: int) -> Optional[float]:
+    """El primer valor de `ema_list` corresponde al índice real `period-1`
+    (dataIndex = period - 1 + i en el HTML). Traduce índice real → índice EMA."""
+    i = data_index - (period - 1)
+    if i < 0 or i >= len(ema_list):
+        return None
+    return ema_list[i]
 
-# Emisión inmediata propia de V2 (combo_verde_agresiva): la tendencia VERDE
-# de Lucky que dispara V2 puede activarse con un simple rebote de 2 rondas
-# (calcular_tendencia_lucky), no necesariamente una tendencia consolidada --
-# exigirle encima la alineación madura de es_tendencia_claramente_alcista_
-# fuerte() (EMA4>EMA8>EMA20 ya alineadas y subiendo) es más estricto que la
-# propia base de V2, y en la práctica casi nunca se cumple a la vez. Se usa
-# en cambio un criterio propio, sin depender de una "tendencia alta":
-AGRESIVO_MIN_INMEDIATA_V2      = 6.0  # pico reciente más alto que el mínimo base (4.0x)
-MARGEN_EMA4_EMA8_INMEDIATA_V2  = 0.5  # EMA4 por encima de EMA8 con margen claro, no un cruce apenas iniciado
-ALTAS_MIN_INMEDIATA_V2         = 3    # cuotas >=2.0x entre las últimas 5 (vs mínimo base de 2)
-RSI_MIN_INMEDIATA_V2           = 50   # zona alcista
-RSI_MAX_INMEDIATA_V2           = 70   # sin llegar a sobrecompra
+def detect_trend_cross_signal(vals: List[float]) -> Dict:
+    """Señal basada 100% en el gráfico de tendencia: cruce alcista de EMA4
+    sobre EMA8 con alineación EMA4>EMA8>EMA20 (mismas 3 EMAs que se dibujan
+    en el panel HTML: celeste=4, amarilla=8, naranja=20) y momentum positivo
+    de las posiciones (≥2x más frecuente que <2x en las últimas 4 rondas)."""
+    out = {'signal': False, 'score': 0, 'ema4': None, 'ema8': None, 'ema20': None,
+           'momentum': 0, 'cruce_alcista': False, 'alineacion_alcista': False}
+    if len(vals) < TREND_MIN_HISTORY:
+        return out
 
-ALERT_LABELS = {
-    'video':                'PATRON V1 💎',
-    'combo_verde_agresiva': 'PATRON V2 💎',
-    'martillo':             'PATRON V3 💎',
-}
-PATTERN_ORDER = ['video', 'combo_verde_agresiva', 'martillo']
+    positions = calc_trend_positions(vals)
+    ema4 = calc_ema_trend(positions, 4)
+    ema8 = calc_ema_trend(positions, 8)
+    ema20 = calc_ema_trend(positions, 20)
+    if not ema4 or not ema8 or not ema20:
+        return out
 
-# ─── SQLITE — ESQUEMA ─────────────────────────────────────────────────────────
+    idx_now, idx_prev = len(vals) - 1, len(vals) - 2
+    e4_now, e4_prev = _ema_at(ema4, 4, idx_now), _ema_at(ema4, 4, idx_prev)
+    e8_now, e8_prev = _ema_at(ema8, 8, idx_now), _ema_at(ema8, 8, idx_prev)
+    e20_now = _ema_at(ema20, 20, idx_now)
+    if None in (e4_now, e4_prev, e8_now, e8_prev, e20_now):
+        return out
+
+    cruce_alcista = e4_prev <= e8_prev and e4_now > e8_now
+    alineacion_alcista = e4_now > e8_now > e20_now
+    momentum = positions[-1] - positions[-4] if len(positions) >= 4 else 0
+
+    if cruce_alcista and alineacion_alcista:
+        score = 100
+    elif alineacion_alcista:
+        score = 75
+    elif e4_now > e8_now:
+        score = 55
+    else:
+        score = 25
+
+    out.update({
+        'signal': cruce_alcista and momentum > 0 and score >= TREND_SIGNAL_SCORE_MIN,
+        'score': score, 'ema4': e4_now, 'ema8': e8_now, 'ema20': e20_now,
+        'momentum': momentum, 'cruce_alcista': cruce_alcista,
+        'alineacion_alcista': alineacion_alcista,
+    })
+    return out
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LÍNEAS CALIENTES ≥5x (amarilla) y ≥10x (morada) — réplica de buildLevels()
+# / drawHotLines() del panel HTML. No disparan señal propia: se registran
+# cada ronda (log_hotline_snapshot) y se anexan como feature a la señal de
+# tendencia, para entrenar el modelo de ML con su aporte real.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def detect_hot_lines(vals: List[float], threshold: float,
+                      tolerance: float = HOTLINE_TOLERANCE,
+                      decay_rounds: int = HOTLINE_DECAY_ROUNDS) -> List[Dict]:
+    if not vals:
+        return []
+    positions = calc_trend_positions(vals)
+    levels: Dict[float, Dict] = {}
+    for i, v in enumerate(vals):
+        pos = positions[i]
+        key = round(pos * 2) / 2
+        if v >= threshold:
+            found = None
+            for k in levels:
+                if abs(k - key) <= tolerance:
+                    found = k
+                    break
+            if found is not None:
+                levels[found]['fuerza'] += 1
+                levels[found]['hits'] += 1
+                levels[found]['sin_hit'] = 0
+            else:
+                levels[key] = {'pos': pos, 'fuerza': 1, 'hits': 1, 'sin_hit': 0}
+        else:
+            for k in levels:
+                if abs(k - key) <= tolerance:
+                    levels[k]['sin_hit'] += 1
+                    if levels[k]['sin_hit'] >= decay_rounds:
+                        levels[k]['fuerza'] = max(0, levels[k]['fuerza'] - 1)
+                        levels[k]['sin_hit'] = 0
+    return [lv for lv in levels.values() if lv['fuerza'] > 0]
+
+def _summarize_hotline(levels: List[Dict]) -> Dict:
+    if not levels:
+        return {'activas': 0, 'fuerza_max': 0, 'hits_max': 0, 'fuerte': False}
+    return {
+        'activas': len(levels),
+        'fuerza_max': max(lv['fuerza'] for lv in levels),
+        'hits_max': max(lv['hits'] for lv in levels),
+        'fuerte': any(lv['hits'] >= 2 and lv['fuerza'] >= 2 for lv in levels),
+    }
+
+def get_hotline_features(vals: List[float]) -> Dict:
+    lines5 = detect_hot_lines(vals, HOTLINE_THRESHOLD_5X)
+    lines10 = detect_hot_lines(vals, HOTLINE_THRESHOLD_10X)
+    return {'linea_5x': _summarize_hotline(lines5), 'linea_10x': _summarize_hotline(lines10)}
+
+def log_hotline_snapshot(vals: List[float]):
+    """Registra el estado actual de ambas líneas calientes en cada ronda,
+    independientemente de si dispara señal — insumo puro para ML."""
+    try:
+        hl = get_hotline_features(vals)
+        con = _db()
+        con.execute(
+            "INSERT INTO hotline_log(tipo, activas, fuerza_max, hits_max, fuerte, ultimo_valor) "
+            "VALUES(?,?,?,?,?,?)",
+            ("5x", hl['linea_5x']['activas'], hl['linea_5x']['fuerza_max'],
+             hl['linea_5x']['hits_max'], int(hl['linea_5x']['fuerte']), vals[-1])
+        )
+        con.execute(
+            "INSERT INTO hotline_log(tipo, activas, fuerza_max, hits_max, fuerte, ultimo_valor) "
+            "VALUES(?,?,?,?,?,?)",
+            ("10x", hl['linea_10x']['activas'], hl['linea_10x']['fuerza_max'],
+             hl['linea_10x']['hits_max'], int(hl['linea_10x']['fuerte']), vals[-1])
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        logger.warning(f"Error guardando hotline_log: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PREDICTOR DE TIEMPO "REBOTE 3x-5x" — réplica de calcularPrediccionInteligente()
+# / checkAutoPredictions() del panel HTML.
+# ═══════════════════════════════════════════════════════════════════════════
+historial_valores_altos: List[Dict] = []   # {'valor','tiempo_seg'}
+recorded_times: List[Dict] = []            # {'tiempo_seg','pre_alert_shown','alert_shown','created','fail_count'}
+# tiempo_seg de la predicción cuya señal de tiempo PERDIÓ y aún está dentro
+# de los -10s posteriores al horario predicho: habilita el reenvío de un
+# nuevo intento con la ronda siguiente (sin esperar un patrón nuevo).
+timing_retry_pred: Optional[int] = None
+
+def calcular_prediccion_inteligente(valor: float):
+    """Cada vez que aparece una ronda ≥TIMING_HIGH_THRESHOLD, guarda su hora y
+    recalcula el próximo horario probable de rebote 3x-5x, promediando el
+    intervalo entre las últimas TIMING_SAMPLE_WINDOW rondas altas."""
+    global historial_valores_altos, recorded_times
+    if valor < TIMING_HIGH_THRESHOLD:
+        return
+    ahora = colombia_now()
+    tiempo_actual = ahora.hour * 3600 + ahora.minute * 60 + ahora.second
+    historial_valores_altos.append({'valor': valor, 'tiempo': tiempo_actual})
+    if len(historial_valores_altos) > TIMING_HISTORY_MAX:
+        historial_valores_altos.pop(0)
+    if len(historial_valores_altos) < 2:
+        return
+    ultimos = historial_valores_altos[-min(TIMING_SAMPLE_WINDOW, len(historial_valores_altos)):]
+    diffs = [ultimos[i]['tiempo'] - ultimos[i-1]['tiempo'] for i in range(1, len(ultimos))]
+    if not diffs:
+        return
+    promedio = sum(diffs) / len(diffs)
+    tiempo_predicho = (ultimos[-1]['tiempo'] + promedio) % 86400
+    ya_existe = any(abs(r['tiempo_seg'] - tiempo_predicho) < TIMING_DEDUPE_SEC for r in recorded_times)
+    if ya_existe:
+        return
+    recorded_times.append({
+        'tiempo_seg': tiempo_predicho, 'pre_alert_shown': False, 'alert_shown': False,
+        'created': tiempo_actual, 'fail_count': 0,  # ← nuevo campo
+    })
+    logger.info(f"[Timing] 🔮 Predicción inteligente: {int(tiempo_predicho//3600):02d}:{int((tiempo_predicho%3600)//60):02d}:{int(tiempo_predicho%60):02d}")
+
+async def check_timing_predictions():
+    """Limpieza de predicciones de tiempo: descarta las que vencieron sin
+    dispararse. La señal ya NO se emite por reloj: solo se dispara cuando una
+    RONDA real cae dentro de la ventana de ±TIMING_ALERT_WINDOW_SEC segundos
+    del horario predicho (ver check_timing_round_trigger, llamada desde
+    process_new_value al llegar cada ronda nueva)."""
+    global recorded_times
+    ahora = colombia_now()
+    actual = ahora.hour * 3600 + ahora.minute * 60 + ahora.second
+    vigentes = []
+    for r in recorded_times:
+        diff = r['tiempo_seg'] - actual
+        # Se permite que la ventana posterior se amplíe según fail_count
+        post_window = TIMING_ALERT_WINDOW_SEC + r.get('fail_count', 0) * 2
+        if diff < -(post_window + 1):
+            logger.info("[Timing] ⏰ Predicción vencida — ninguna ronda cayó en la ventana")
+            continue
+        vigentes.append(r)
+    recorded_times = vigentes
+
+async def check_timing_round_trigger():
+    """Dispara la señal de tiempo con ventanas dinámicas según fallos acumulados.
+    Cada fallo reduce el preaviso mínimo/máximo y amplía la ventana posterior."""
+    global recorded_times, timing_retry_pred
+    if sig_state != "idle" or pending_confirmation:
+        return
+    ahora = colombia_now()
+    actual = ahora.hour * 3600 + ahora.minute * 60 + ahora.second
+    for r in recorded_times:
+        diff = r['tiempo_seg'] - actual
+        fail_count = r.get('fail_count', 0)
+        # Umbrales dinámicos
+        min_sec = max(0, TIMING_PREALERT_MIN_SEC - fail_count * 3)
+        max_sec = max(5, TIMING_PREALERT_MAX_SEC - fail_count * 3)
+        post_window = TIMING_ALERT_WINDOW_SEC + fail_count * 2
+
+        if not (-post_window <= diff <= max_sec):
+            continue
+        # Primer intento: debe estar entre min_sec y max_sec
+        primera_vez = (not r['alert_shown'] and min_sec <= diff <= max_sec)
+        # Reintento: si ya se emitió y estamos dentro de la ventana posterior ampliada
+        reintento = (r['alert_shown'] and timing_retry_pred == r['tiempo_seg']
+                     and diff >= -post_window)
+        if primera_vez or reintento:
+            r['alert_shown'] = True
+            timing_retry_pred = None
+            if reintento:
+                logger.info(f"[Timing] 🔁 Reintento de señal de tiempo (fail_count={fail_count}, diff={diff:.0f}s)")
+            else:
+                logger.info(f"[Timing] ⏰ Enviando señal {diff:.0f}s antes del rebote (fail_count={fail_count})")
+            await emit_timing_signal()
+            break
+
+async def emit_timing_signal():
+    """Emite la señal de tiempo (ventana 3x-5x) reutilizando el mismo pipeline
+    de sesión/ML que la señal de tendencia — el objetivo de retiro sigue
+    siendo 2x. Ya no se bloquea por tendencia general."""
+    ultimo_valor = history[-1] if history else 0.0
+    features = {
+        'tipo_key': 'timing_3x_5x',
+        'ultimo_valor': ultimo_valor,
+        'confidence': 60,
+        'tendencia_lucky': 'AMARILLO',
+        'agresiva_condicion': False,
+        'ema4': None, 'ema8': None, 'ema20': None, 'ema50': None,
+        'votos': {}, 'contar_entrar': 0, 'contar_no_entrar': 0, 'risk_score': 0,
+        'rsi': None, 'macd': None, 'fuerza': None, 'ia_prob': None,
+        'racha_rango_activa': False, 'rango_activo': "3.00x-5.00x",
+    }
+    features_json = json.dumps(features, default=str)
+    label = "SEÑAL DE TIEMPO 3x-5x ⏰"
+    motivo = "Horario predicho de rebote 3x-5x alcanzado — objetivo de retiro 2.00x"
+    await emit_signal(ultimo_valor, 'timing_3x_5x', label, motivo, features_json,
+                       confirmada_por_espera=False)
+
+def evaluate_signal(vals: List[float]) -> Optional[tuple]:
+    """Única fuente de señales de entrada: cruce alcista del gráfico de
+    tendencia (EMA4/8/20 sobre las posiciones ≥2x/<2x). Las líneas calientes
+    5x/10x se anexan como feature informativa (no disparan por sí solas) para
+    que el modelo de ML aprenda su aporte real."""
+    trend = detect_trend_cross_signal(vals)
+    if not trend['signal']:
+        return None
+
+    hotlines = get_hotline_features(vals)
+    features = {
+        'tipo_key': 'tendencia_grafico',
+        'ultimo_valor': vals[-1],
+        'confidence': trend['score'],
+        'tendencia_lucky': 'VERDE' if trend['score'] >= 75 else 'AMARILLO',
+        'agresiva_condicion': False,
+        'ema4': trend['ema4'], 'ema8': trend['ema8'], 'ema20': trend['ema20'], 'ema50': None,
+        'momentum': trend['momentum'],
+        'cruce_alcista': trend['cruce_alcista'],
+        'alineacion_alcista': trend['alineacion_alcista'],
+        'linea_5x_activa': hotlines['linea_5x']['fuerte'],
+        'linea_5x_fuerza': hotlines['linea_5x']['fuerza_max'],
+        'linea_10x_activa': hotlines['linea_10x']['fuerte'],
+        'linea_10x_fuerza': hotlines['linea_10x']['fuerza_max'],
+        'votos': {}, 'contar_entrar': 0, 'contar_no_entrar': 0, 'risk_score': 0,
+        'rsi': None, 'macd': None, 'fuerza': None, 'ia_prob': None,
+        'racha_rango_activa': False, 'rango_activo': None,
+    }
+    prob = predict_prob('tendencia_grafico', features)
+    if prob is not None and prob < MODEL_MIN_PROB:
+        logger.info(f"[v22] ML probability {prob:.2f} < {MODEL_MIN_PROB}, señal (tendencia) descartada")
+        return None
+
+    label = "SEÑAL DE TENDENCIA 📈"
+    motivo = (f"Cruce EMA4>EMA8, alineación {'alcista' if trend['alineacion_alcista'] else 'parcial'}, "
+              f"score {trend['score']}, momentum {trend['momentum']:.0f}")
+    features_json = json.dumps(features, default=str)
+    return ('tendencia_grafico', label, motivo, features_json, True)
+
+# ─── FUNCIONES PARA CÁLCULO DE PORCENTAJES DE RANGOS ──────────────────────
+def calc_pct_rangos(vals: List[float]) -> tuple:
+    if len(vals) < 200:
+        return 0.0, 0.0
+    ultimas = vals[-200:]
+    total = len(ultimas)
+    rango1 = sum(1 for v in ultimas if 1.00 <= v < 2.00)
+    rango2 = sum(1 for v in ultimas if 2.00 <= v < 5.00)
+    return (rango1 / total) * 100, (rango2 / total) * 100
+
+# Umbrales de tendencia favorable/desfavorable (ajustables por env)
+TREND_RANGO1_MAX = float(os.environ.get("TREND_RANGO1_MAX", "54"))
+TREND_RANGO2_MIN = float(os.environ.get("TREND_RANGO2_MIN", "28"))
+
+def calc_pct_rangos_full(vals: List[float]) -> tuple:
+    """Devuelve (conteo_rango1, conteo_rango2, pct_rango1, pct_rango2) sobre las últimas 200 rondas."""
+    if len(vals) < 200:
+        ultimas = vals
+    else:
+        ultimas = vals[-200:]
+    total = len(ultimas)
+    rango1 = sum(1 for v in ultimas if 1.00 <= v < 2.00)
+    rango2 = sum(1 for v in ultimas if 2.00 <= v < 5.00)
+    pct1 = (rango1 / total) * 100 if total else 0.0
+    pct2 = (rango2 / total) * 100 if total else 0.0
+    return rango1, rango2, pct1, pct2
+
+# ─── MENSAJES ─────────────────────────────────────────────────────────────────
+def build_signal_msg(tipo_label: str, last_value: float, sesion_index: int,
+                     pct_rango1: float, pct_rango2: float,
+                     ronda_predicha: Optional[int] = None) -> str:
+    # Formato fijo de señal — sin línea de ronda predicha por el ML de timing.
+    return (
+        f"<b>✅✅ ENTRADA CONFIRMADA ✅✅</b>\n\n"
+        f"👉 INGRESAR DESPUÉS: {last_value:.2f}x\n"
+        f"💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x\n\n"
+        f"🧠 GESTIÓN MASSANIELLO: {sesion_index}/5\n"
+        f"📈 TENDENCIA 200 RONDAS\n"
+        f"🔵 1.00x-1.99x = {pct_rango1:.2f}%\n"
+        f"🟢 2.00x-4.99x = {pct_rango2:.2f}%\n\n"
+        f"💡 ¡Juegue con Responsabilidad!\n"
+        f'🎰 <a href="{GAME_LINK}">Acceder al Spaceman</a>'
+    )
+
+def build_win_msg(result: float, intento: int) -> str:
+    return (
+        "<b>🍀🍀🍀 GANAMOS!!! 🍀🍀🍀</b>\n"
+        f"<b>✅ Resultado: {result:.2f}x — INTENTO {intento}</b>"
+    )
+
+def build_loss_msg(intento: int, result: float) -> str:
+    return (
+        f"🧠 <b>INTENTO FALLIDO!!! Resultado: {result:.2f}x</b>\n"
+        f"💥 Mantener la calma intento {intento} de 5"
+    )
+
+def build_win_status_msg(intento: int) -> str:
+    return f"✅ WIN INTENTO {intento}"
+
+def build_loss_status_msg(intento: int) -> str:
+    return f"❌ LOSS INTENTO {intento}"
+
+def build_trend_status_msg(rango1_count: int, rango2_count: int, pct_rango1: float, pct_rango2: float) -> str:
+    hora_ar = datetime.now(ARG_TZ).strftime("%H:%M:%S")
+    favorable = pct_rango1 < TREND_RANGO1_MAX and pct_rango2 > TREND_RANGO2_MIN
+    estado = "✅ FAVORABLE" if favorable else "❌ DESFAVORABLE"
+    return (
+        f"{estado} — {hora_ar} (ARG)\n\n"
+        "📈 TENDENCIA 200 RONDAS\n"
+        f"🔵 (1.00x-1.99x) {rango1_count} — {pct_rango1:.2f}%\n"
+        f"🟢 (2.00x-4.99x) {rango2_count} — {pct_rango2:.2f}%"
+    )
+
+def build_session_loss_msg(last_result: float) -> str:
+    return (
+        "<b>❎❎❎ PERDIMOS!!! ❎❎❎</b>\n"
+        f"<b>❌ Resultado: {last_result:.2f}x — Sesión Fallida.</b>"
+    )
+
+def build_stats_msg() -> str:
+    total = daily_wins + daily_losses
+    pct = (daily_wins / total * 100) if total > 0 else 0.0
+    return (
+        f"🚀 <b>Resultado del día ✅ {daily_wins} | ⭕ {daily_losses}</b>\n"
+        f"💎 <b>Acertamos el {pct:.2f}% de las Sesiones</b>\n"
+        f"📈 <b>¡{consecutive_wins} Sesiones Ganadas Consecutivas!</b>"
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SQLITE, ESTADO, ML, etc.
+# ═══════════════════════════════════════════════════════════════════════════
+
 def db_init():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -192,9 +569,26 @@ def db_init():
         context_json    TEXT,
         created         TEXT    NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS hotline_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        tipo        TEXT    NOT NULL,
+        activas     INTEGER,
+        fuerza_max  INTEGER,
+        hits_max    INTEGER,
+        fuerte      INTEGER,
+        ultimo_valor REAL,
+        created     TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
     """)
     try:
         cur.execute("ALTER TABLE pattern_stats ADD COLUMN features_json TEXT")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        # Marca si la ronda resuelta llegó a 4x — registro adicional para
+        # entrenar el modelo con la señal 2x/4x pedida (retiro sigue en 2x).
+        cur.execute("ALTER TABLE pattern_stats ADD COLUMN supero_4x INTEGER DEFAULT 0")
         con.commit()
     except sqlite3.OperationalError:
         pass
@@ -227,6 +621,11 @@ def save_state():
         "consecutive_losses": str(consecutive_losses),
         "ml_last_trained_count": str(ml_last_trained_count),
         "timing_last_trained_count": str(timing_last_trained_count),
+        "session_signal_count": str(session_signal_count),
+        "pending_signal_index": str(pending_signal_index),
+        "is_last_signal_of_session": "1" if is_last_signal_of_session else "0",
+        "pending_confirmation": "1" if pending_confirmation else "0",
+        "pending_confirmation_data": json.dumps(pending_confirmation_data) if pending_confirmation_data else "",
     }
     _save_dict(values)
 
@@ -235,10 +634,12 @@ def load_state():
     global sig_inmediata, sig_emit_attempt, sig_context_json, sig_signal_id, stats_msg_id
     global daily_wins, daily_losses, consecutive_wins, consecutive_losses
     global ml_last_trained_count, timing_last_trained_count
-    
+    global session_signal_count, pending_signal_index, is_last_signal_of_session
+    global pending_confirmation, pending_confirmation_data
+
     d = _load_dict()
     sig_state         = d.get("sig_state", "idle") or "idle"
-    if sig_state not in ("idle", "pending", "active"):
+    if sig_state not in ("idle", "active"):
         sig_state = "idle"
     sig_attempt        = int(d.get("sig_attempt", "0") or "0")
     sig_last_attempt   = int(d.get("sig_last_attempt", str(MAX_ATTEMPTS_NORMAL)) or str(MAX_ATTEMPTS_NORMAL))
@@ -248,7 +649,7 @@ def load_state():
     sig_tipo_key      = d.get("sig_tipo_key", "") or None
     sig_features      = d.get("sig_features", "") or None
     sig_inmediata     = (d.get("sig_inmediata", "0") or "0") == "1"
-    sig_emit_attempt  = int(d.get("sig_emit_attempt", "2") or "2")
+    sig_emit_attempt  = int(d.get("sig_emit_attempt", "1") or "1")
     sig_context_json  = d.get("sig_context_json", "") or None
     sig_signal_id     = d.get("sig_signal_id", "") or None
     _sid              = d.get("stats_msg_id", "")
@@ -259,7 +660,21 @@ def load_state():
     consecutive_losses = int(d.get("consecutive_losses", "0"))
     ml_last_trained_count = int(d.get("ml_last_trained_count", "0") or "0")
     timing_last_trained_count = int(d.get("timing_last_trained_count", "0") or "0")
-    logger.info(f"[v17] Estado cargado | estado={sig_state} intento={sig_attempt} tipo={sig_tipo} emit_attempt={sig_emit_attempt}")
+    session_signal_count = int(d.get("session_signal_count", "0") or "0")
+    if session_signal_count < 0 or session_signal_count > 5:
+        session_signal_count = 0
+    pending_signal_index = int(d.get("pending_signal_index", "0") or "0")
+    is_last_signal_of_session = (d.get("is_last_signal_of_session", "0") or "0") == "1"
+    pending_confirmation = (d.get("pending_confirmation", "0") or "0") == "1"
+    _pcd = d.get("pending_confirmation_data", "")
+    try:
+        pending_confirmation_data = json.loads(_pcd) if _pcd else None
+    except (TypeError, ValueError):
+        pending_confirmation_data = None
+    logger.info(
+        f"[v21] Estado cargado | estado={sig_state} sesion={session_signal_count} "
+        f"esperando_confirmacion={pending_confirmation}"
+    )
 
 def _save_dict(values: dict):
     try:
@@ -284,7 +699,6 @@ def _load_dict() -> dict:
         logger.warning(f"Error cargando estado: {e}")
         return {}
 
-# ─── PERSISTENCIA — HISTORIAL ─────────────────────────────────────────────────
 def save_value(value: float):
     try:
         con = _db()
@@ -311,22 +725,24 @@ def load_history() -> List[float]:
         logger.warning(f"Error cargando history: {e}")
         return []
 
-# ─── PERSISTENCIA — EFECTIVIDAD POR PATRÓN ───────────────────────────────────
 def log_pattern_result(tipo_key: str, tipo_label: str, result: str, value: float,
                        attempt: int = 0, features_json: Optional[str] = None):
+    """Registra el resultado de la señal. `supero_4x` queda grabado aparte
+    (valor ≥4.00x) para entrenar el modelo con la distinción 2x/4x pedida —
+    el objetivo de retiro real de la señal sigue siendo siempre 2x."""
     try:
         con = _db()
         con.execute(
-            "INSERT INTO pattern_stats(tipo_key, tipo_label, result, value, attempt, features_json) "
-            "VALUES(?,?,?,?,?,?)",
-            (tipo_key or "desconocido", tipo_label or "", result, value, attempt, features_json)
+            "INSERT INTO pattern_stats(tipo_key, tipo_label, result, value, attempt, features_json, supero_4x) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (tipo_key or "desconocido", tipo_label or "", result, value, attempt, features_json,
+             int(value >= 4.00))
         )
         con.commit()
         con.close()
     except Exception as e:
         logger.warning(f"Error guardando pattern_stats: {e}")
 
-# ─── PERSISTENCIA — CONTEXTO DE SEÑAL (ML TIMING) ────────────────────────────
 def log_signal_context(signal_id: str, tipo_key: str, trigger_value: float,
                        attempt_when_win: Optional[int], result: str,
                        context_json: str):
@@ -379,37 +795,19 @@ def build_pattern_stats_msg() -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━",
     ]
     total_wins = total_losses = 0
-    conocidos = set(PATTERN_ORDER)
-    hubo_datos = False
-    for key in PATTERN_ORDER:
-        label = ALERT_LABELS.get(key, key)
-        d = data.get(key)
-        if not d or d["total"] == 0:
-            lines.append(f"{label}: <i>sin señales</i>")
-            continue
-        hubo_datos = True
-        wins, losses, total = d["wins"], d["losses"], d["total"]
-        pct = (wins / total * 100) if total else 0.0
-        total_wins   += wins
-        total_losses += losses
-        lines.append(f"{label}: ✅{wins} ❌{losses} — <b>{pct:.1f}%</b> ({total})")
-    
     for key, d in data.items():
-        if key in conocidos or not d or d["total"] == 0:
+        if d["total"] == 0:
             continue
-        hubo_datos = True
         wins, losses, total = d["wins"], d["losses"], d["total"]
         pct = (wins / total * 100) if total else 0.0
         total_wins   += wins
         total_losses += losses
         lines.append(f"{key}: ✅{wins} ❌{losses} — <b>{pct:.1f}%</b> ({total})")
-    
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━")
     grand_total = total_wins + total_losses
     grand_pct   = (total_wins / grand_total * 100) if grand_total else 0.0
     lines.append(f"🌐 <b>TOTAL: ✅{total_wins} ❌{total_losses} — {grand_pct:.1f}%</b>")
-    
-    if not hubo_datos:
+    if not data:
         lines.append("<i>Sin señales registradas en las últimas 24h.</i>")
     return "\n".join(lines)
 
@@ -424,7 +822,7 @@ sig_tipo:          Optional[str] = None
 sig_tipo_key:      Optional[str] = None
 sig_features:      Optional[str] = None
 sig_inmediata:     bool          = False
-sig_emit_attempt:  int           = 2
+sig_emit_attempt:  int           = 1
 sig_context_json:  Optional[str] = None
 sig_signal_id:     Optional[str] = None
 stats_msg_id:      Optional[int] = None
@@ -432,6 +830,21 @@ daily_wins:        int           = 0
 daily_losses:      int           = 0
 consecutive_wins:  int           = 0
 consecutive_losses: int          = 0
+session_signal_count: int        = 0
+pending_signal_index: int        = 0
+is_last_signal_of_session: bool  = False
+current_session_results: List[bool] = []  # almacena wins/losses de la sesión actual
+trend_msg_id: Optional[int] = None
+
+# ─── CONFIRMACIÓN PREVIA AL ENVÍO (nuevo) ────────────────────────────────────
+# Si el patrón se detecta pero la última cuota registrada ya fue ≥2x, la señal
+# NO se envía todavía: se guarda como pendiente y se espera a la siguiente
+# ronda. Recién cuando esa ronda de confirmación resulte <2x se emite la
+# señal al Telegram. Ambos caminos (inmediato vs. confirmado por espera)
+# quedan registrados en signal_contexts para que el modelo de timing pueda
+# aprender cuál conviene mejor.
+pending_confirmation: bool = False
+pending_confirmation_data: Optional[dict] = None  # {tipo_key, label, motivo, features_json}
 
 # ─── BOTS + FLASK ─────────────────────────────────────────────────────────────
 bot = AsyncTeleBot(BOT_TOKEN, parse_mode='HTML')
@@ -453,7 +866,7 @@ async def send_msg(text: str, no_preview: bool = False,
         msg = await bot.send_message(**kwargs)
         return msg.message_id
     except Exception as e:
-        logger.warning(f"[v17] send error (chat_id={CHAT_ID_BASE}, thread_id={thread_id}): {e}")
+        logger.warning(f"[v21] send error: {e}")
         return None
 
 async def send_signal_msg(text: str, no_preview: bool = False) -> Optional[int]:
@@ -462,20 +875,15 @@ async def send_signal_msg(text: str, no_preview: bool = False) -> Optional[int]:
 async def send_stats_msg(text: str, no_preview: bool = False) -> Optional[int]:
     return await send_msg(text, no_preview=no_preview, thread_id=THREAD_STATS)
 
-async def edit_msg(msg_id: int, text: str, no_preview: bool = False,
-                   thread_id: Optional[int] = None) -> bool:
+async def edit_msg(msg_id: int, text: str, no_preview: bool = False) -> bool:
     try:
-        kwargs = {
-            "chat_id": CHAT_ID_BASE,
-            "message_id": msg_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": no_preview,
-        }
-        await bot.edit_message_text(**kwargs)
+        await bot.edit_message_text(
+            text, CHAT_ID_BASE, msg_id,
+            parse_mode='HTML', disable_web_page_preview=no_preview
+        )
         return True
     except Exception as e:
-        logger.debug(f"[v17] edit error {msg_id}: {e}")
+        logger.debug(f"edit error: {e}")
         return False
 
 async def delete_msg(msg_id: int) -> bool:
@@ -483,10 +891,31 @@ async def delete_msg(msg_id: int) -> bool:
         await bot.delete_message(CHAT_ID_BASE, msg_id)
         return True
     except Exception as e:
-        logger.debug(f"[v17] delete error {msg_id}: {e}")
+        logger.debug(f"delete error: {e}")
         return False
 
-# ─── ANÁLISIS DE TENDENCIA ────────────────────────────────────────────────────
+async def update_trend_status_msg(vals: List[float], resolved: bool):
+    """Actualiza el mensaje de tendencia en el chat de status.
+    Si `resolved` es True (se acaba de resolver un intento win/loss), borra el
+    mensaje anterior y envía uno nuevo. Si es False (no hubo resolución en este
+    tick), simplemente edita el mensaje existente en su lugar."""
+    global trend_msg_id
+    r1, r2, pct1, pct2 = calc_pct_rangos_full(vals)
+    text = build_trend_status_msg(r1, r2, pct1, pct2)
+
+    if resolved:
+        if trend_msg_id:
+            await delete_msg(trend_msg_id)
+        trend_msg_id = await send_stats_msg(text)
+        return
+
+    if trend_msg_id:
+        ok = await edit_msg(trend_msg_id, text)
+        if ok:
+            return
+    trend_msg_id = await send_stats_msg(text)
+
+# ─── ANÁLISIS DE TENDENCIA (simple) ─────────────────────────────────────────
 def get_stats() -> dict:
     total = len(history)
     if total == 0:
@@ -496,838 +925,17 @@ def get_stats() -> dict:
     two_to_five = sum(1 for v in history if 2.00 <= v < 5.00)
     pct_below2  = (below2 / total) * 100
     pct_2to5    = (two_to_five / total) * 100
-    favorable   = (pct_below2 < UMBRAL_BELOW2) and (pct_2to5 > UMBRAL_2TO5)
+    favorable   = (pct_below2 < 53.51) and (pct_2to5 > 26.99)
     return {
         "total": total, "below2": below2, "two_to_five": two_to_five,
         "pct_below2": pct_below2, "pct_2to5": pct_2to5, "favorable": favorable,
     }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# INDICADORES BASE
-# ═══════════════════════════════════════════════════════════════════════════
-def compute_niveles(vals: List[float]) -> List[float]:
-    niveles = []
-    nivel = 0
-    for v in vals:
-        if v >= 2.00:
-            nivel += 1
-        elif 1.00 <= v <= 1.99:
-            nivel -= 1
-        niveles.append(nivel)
-    return niveles
-
-def ema_html(period: int, vals: List[float]) -> List[float]:
-    if not vals:
-        return []
-    k = 2 / (period + 1)
-    prev = vals[0]
-    out = [prev]
-    for i in range(1, len(vals)):
-        actual = vals[i] * k + prev * (1 - k)
-        out.append(actual)
-        prev = actual
-    return out
-
-def calcular_confianza(vals: List[float]) -> float:
-    if len(vals) < 5:
-        return 50
-    last5 = vals[-5:]
-    altos = sum(1 for v in last5 if v >= 2.0)
-    bajos = sum(1 for v in last5 if v < 1.5)
-    if altos >= 3:
-        conf = 80 + altos * 5
-    elif bajos >= 3:
-        conf = 25 + altos * 5
-    else:
-        conf = 40 + altos * 10 - bajos * 5
-    return min(99, max(5, conf))
-
-def calcular_tendencia_lucky(vals: List[float], niveles: List[float]) -> str:
-    if len(niveles) < 8:
-        return 'ROJO'
-    datos = niveles[-12:]
-    slope, _ = calcular_regresion_lineal(datos)
-    racha_bajos = 0
-    i = len(vals) - 2
-    while i >= 0 and vals[i] < 2.0:
-        racha_bajos += 1
-        i -= 1
-    rebote = racha_bajos >= 2 and len(vals) >= 2 and vals[-1] > vals[-2]
-    return 'VERDE' if (slope > 0.05 or rebote) else 'ROJO'
-
-def calcular_regresion_lineal(data: List[float]):
-    n = len(data)
-    if n < 2:
-        return 0.0, 0.0
-    sum_x = sum_y = sum_xy = sum_x2 = sum_y2 = 0.0
-    for i, v in enumerate(data):
-        sum_x += i; sum_y += v; sum_xy += i * v; sum_x2 += i * i; sum_y2 += v * v
-    denom = n * sum_x2 - sum_x * sum_x
-    if denom == 0:
-        return 0.0, 0.0
-    slope = (n * sum_xy - sum_x * sum_y) / denom
-    mean_y = sum_y / n
-    ss_tot = sum_y2 - n * mean_y * mean_y
-    intercept = (sum_y - slope * sum_x) / n
-    ss_res = 0.0
-    for i, v in enumerate(data):
-        pred = slope * i + intercept
-        ss_res += (v - pred) ** 2
-    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-    return slope, r2
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FILTROS OPTIMIZADOS v13
-# ═══════════════════════════════════════════════════════════════════════════
-def filtro_v1_video(vals: List[float], ema8: List[float]) -> bool:
-    if len(vals) < 3 or len(ema8) < 2:
-        return False
-    if not all(v < 2.0 for v in vals[-3:]):
-        return False
-    if not (ema8[-1] > ema8[-2]):
-        return False
-    return True
-
-def filtro_v2_combo(vals: List[float], ema4: List[float], ema8: List[float]) -> bool:
-    if len(vals) < 5 or not ema4 or not ema8:
-        return False
-    ultimos_5 = vals[-5:]
-    conteo_altos = sum(1 for v in ultimos_5 if v >= 2.0)
-    if conteo_altos < 2:
-        return False
-    if not (ema4[-1] > ema8[-1]):
-        return False
-    return True
-
-def filtro_v3_martillo(vals: List[float], ema8: List[float]) -> bool:
-    if len(vals) < 3 or len(ema8) < 3:
-        return False
-    if vals[-2] >= UMBRAL_VALLE_V3:
-        return False
-    e8 = ema8[-1]
-    if e8 <= 0:
-        return False
-    ratio = vals[-1] / e8
-    if not (DIST_MIN_EMA8_V3 <= ratio <= DIST_MAX_EMA8_V3):
-        return False
-    if not (ema8[-1] > ema8[-2] > ema8[-3]):
-        return False
-    return True
-
-# ═══════════════════════════════════════════════════════════════════════════
-# EMISIÓN INMEDIATA
-# ═══════════════════════════════════════════════════════════════════════════
-def es_tendencia_claramente_alcista_fuerte(vals, ema4, ema8, ema20, rsi, tendencia_lucky) -> bool:
-    if len(vals) < 5 or len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 2:
-        return False
-    if tendencia_lucky != 'VERDE':
-        return False
-    e4, e8, e20 = ema4[-1], ema8[-1], ema20[-1]
-    if not (e4 > e8 > e20):
-        return False
-    e4p, e8p, e20p = ema4[-2], ema8[-2], ema20[-2]
-    if not (e4 > e4p and e8 > e8p and e20 > e20p):
-        return False
-    if not rsi or len(rsi) == 0:
-        return False
-    rsi_val = rsi[-1]
-    if not (45 <= rsi_val <= 65):
-        return False
-    if vals[-1] < 2.0:
-        return False
-    ultimos_5 = vals[-5:]
-    if sum(1 for v in ultimos_5 if v >= 2.0) < 2:
-        return False
-    return True
-
-def cumple_condiciones_opcionales_inmediata(vals, macd) -> int:
-    cumplidas = 0
-    if len(vals) >= 3:
-        v1, v2, v3 = vals[-3], vals[-2], vals[-1]
-        if v1 < v2 < v3:
-            cumplidas += 1
-    if len(vals) >= 4:
-        racha_bajos = 0
-        i = len(vals) - 2
-        while i >= 0 and vals[i] < 2.0:
-            racha_bajos += 1
-            i -= 1
-        if racha_bajos >= 3 and vals[-1] >= 2.0:
-            cumplidas += 1
-    if macd and len(macd) >= 2:
-        if macd[-1] > 0 and macd[-1] > macd[-2]:
-            cumplidas += 1
-    return cumplidas
-
-def agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_score) -> bool:
-    if risk_score >= 7:
-        return False
-    if contar_no_entrar >= 4 and contar_no_entrar > contar_entrar:
-        return False
-    return True
-
-def es_v1_video_alta_confianza(vals: List[float], ema8: List[float], rsi: Optional[List[float]]) -> bool:
-    """Criterio de emisión inmediata específico para V1 (video).
-    es_tendencia_claramente_alcista_fuerte() es estructuralmente incompatible
-    con V1: exige vals[-1] >= 2.0, mientras que filtro_v1_video() exige que
-    las últimas 3 cuotas sean < 2.0 -- por diseño nunca coinciden. V1 necesita
-    entonces su propio criterio de "alta confianza", pensado para el mismo
-    contexto en el que V1 dispara (racha de cuotas bajas + EMA8 girando al
-    alza), pero más exigente que el mínimo del patrón base:
-      • Racha de cuotas < 2.0x más profunda (>= 5, vs el mínimo de 3 de V1)
-      • EMA8 confirmando el giro en 3 lecturas seguidas, no solo la última
-      • RSI en sobreventa clara (refuerza que el rebote es probable)
-    """
-    if len(vals) < 5 or len(ema8) < 3:
-        return False
-    racha_bajos = 0
-    i = len(vals) - 1
-    while i >= 0 and vals[i] < 2.0:
-        racha_bajos += 1
-        i -= 1
-    if racha_bajos < RACHA_BAJOS_MIN_INMEDIATA_V1:
-        return False
-    if not (ema8[-1] > ema8[-2] > ema8[-3]):
-        return False
-    if not rsi or len(rsi) == 0:
-        return False
-    if rsi[-1] > RSI_OVERSOLD_V1:
-        return False
-    return True
-
-def es_v3_martillo_alta_confianza(vals: List[float], ema8: List[float], rsi: Optional[List[float]]) -> bool:
-    """Criterio de emisión inmediata específico para V3 (martillo).
-    Igual que V1, el martillo es un patrón de rebote desde un valle -- pedirle
-    la tendencia madura y sostenida de es_tendencia_claramente_alcista_fuerte()
-    (EMA4>EMA8>EMA20 ya alineadas y subiendo) es poco realista justo en el
-    momento del giro: esa condición describe una tendencia ya consolidada, no
-    un rebote recién iniciado. V3 necesita entonces su propio criterio de
-    "alta confianza", más exigente que el mínimo de filtro_v3_martillo():
-      • Valle más profundo que el mínimo base (< 1.20, vs el mínimo de 1.5)
-      • Rebote fuerte: la cuota actual >= 50% por encima del valle
-      • EMA8 confirmando el giro en 4 lecturas seguidas (una más que la base)
-      • RSI saliendo de sobreventa (recuperación, no aún neutral/maduro)
-    """
-    if len(vals) < 6 or len(ema8) < 4:
-        return False
-    valle = vals[-2]
-    if valle <= 0 or valle >= VALLE_MIN_INMEDIATA_V3:
-        return False
-    rebote_ratio = vals[-1] / valle
-    if rebote_ratio < REBOTE_MIN_INMEDIATA_V3:
-        return False
-    if not (ema8[-1] > ema8[-2] > ema8[-3] > ema8[-4]):
-        return False
-    if not rsi or len(rsi) == 0:
-        return False
-    r = rsi[-1]
-    if not (RSI_RECUP_MIN_V3 <= r <= RSI_RECUP_MAX_V3):
-        return False
-    return True
-
-def es_v2_combo_alta_confianza(vals: List[float], ema4: List[float], ema8: List[float],
-                                rsi: Optional[List[float]]) -> bool:
-    """Criterio de emisión inmediata específico para V2 (combo_verde_agresiva),
-    sin depender de una "tendencia alta" madura. La tendencia VERDE de Lucky
-    que dispara V2 puede activarse con un simple rebote de 2 rondas
-    (calcular_tendencia_lucky), no necesariamente EMA4>EMA8>EMA20 alineadas y
-    subiendo -- por eso, en vez de es_tendencia_claramente_alcista_fuerte(),
-    se usa un criterio propio, más exigente que el mínimo de filtro_v2_combo():
-      • Pico agresivo reciente más alto que el mínimo base (>= 6.0x, vs 4.0x)
-      • EMA4 por encima de EMA8 con margen claro (no un cruce apenas iniciado)
-      • Más cuotas altas recientes que el mínimo base (>= 3 de las últimas 5)
-      • RSI en zona alcista sin llegar a sobrecompra (50-70)
-    """
-    if len(vals) < 5 or not ema4 or not ema8:
-        return False
-    ventana = vals[-10:] if len(vals) >= 10 else vals
-    max_rec = max(ventana)
-    if max_rec < AGRESIVO_MIN_INMEDIATA_V2:
-        return False
-    if (ema4[-1] - ema8[-1]) < MARGEN_EMA4_EMA8_INMEDIATA_V2:
-        return False
-    ultimos_5 = vals[-5:]
-    if sum(1 for v in ultimos_5 if v >= 2.0) < ALTAS_MIN_INMEDIATA_V2:
-        return False
-    if not rsi or len(rsi) == 0:
-        return False
-    r = rsi[-1]
-    if not (RSI_MIN_INMEDIATA_V2 <= r <= RSI_MAX_INMEDIATA_V2):
-        return False
-    return True
-
-# ═══════════════════════════════════════════════════════════════════════════
-# PATRONES BASE
-# ═══════════════════════════════════════════════════════════════════════════
-def detectar_martillo_base(vals: List[float], ema8: List[float]) -> bool:
-    if len(vals) < 3 or not ema8:
-        return False
-    last = len(vals) - 1
-    current_val, prev_val = vals[last], vals[last - 1]
-    return (current_val > prev_val) and (prev_val < vals[last - 2]) and (current_val > ema8[-1])
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SOPORTE/RESISTENCIA · RSI · MACD · FIBONACCI
-# ═══════════════════════════════════════════════════════════════════════════
-def calcular_soporte_resistencia_fuerte(niveles: List[float]) -> dict:
-    if len(niveles) < 10:
-        return {'soporte': None, 'resistencia': None}
-    highs, lows = [], []
-    for i in range(1, len(niveles) - 1):
-        if niveles[i] > niveles[i - 1] and niveles[i] > niveles[i + 1]:
-            highs.append(niveles[i])
-        if niveles[i] < niveles[i - 1] and niveles[i] < niveles[i + 1]:
-            lows.append(niveles[i])
-    highs.sort(reverse=True)
-    lows.sort()
-    resistencia = sum(highs[:3]) / min(3, len(highs)) if highs else None
-    soporte     = sum(lows[:3]) / min(3, len(lows)) if lows else None
-    return {'soporte': soporte, 'resistencia': resistencia}
-
-def calcular_rsi(niveles: List[float]) -> List[float]:
-    if len(niveles) < 15:
-        return []
-    gains, losses = [], []
-    for i in range(1, len(niveles)):
-        change = niveles[i] - niveles[i - 1]
-        if change > 0:
-            gains.append(change); losses.append(0)
-        else:
-            gains.append(0); losses.append(abs(change))
-    rsi = []
-    for i in range(13, len(gains)):
-        avg_gain = sum(gains[i - 13:i + 1]) / 14
-        avg_loss = sum(losses[i - 13:i + 1]) / 14
-        rsi.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
-    return rsi
-
-def calcular_macd(niveles: List[float]) -> List[float]:
-    if len(niveles) < 26:
-        return []
-    ema12 = ema_html(12, niveles)
-    ema26 = ema_html(26, niveles)
-    return [ema12[i] - ema26[i] for i in range(len(niveles))]
-
-def calcular_fibonacci(niveles: List[float]) -> dict:
-    if len(niveles) < 2:
-        return {}
-    mx, mn = max(niveles), min(niveles)
-    diff = mx - mn
-    return {'0.0%': mx, '38.2%': mx - diff * 0.382, '61.8%': mx - diff * 0.618, '100.0%': mn}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ESTADÍSTICAS AVANZADAS (agente 5)
-# ═══════════════════════════════════════════════════════════════════════════
-def get_tipo_dato(v: float) -> str:
-    if v < 2.0:
-        return 'low'
-    if v < 5.0:
-        return 'mid'
-    return 'high'
-
-def calcular_rachas(data: List[float]) -> dict:
-    current_type = get_tipo_dato(data[-1])
-    current_streak = 1
-    for i in range(len(data) - 1, -1, -1):
-        if get_tipo_dato(data[i]) == current_type:
-            current_streak += 1
-        else:
-            break
-    max_low = max_mid = max_high = 0
-    prev_tipo = None
-    streak_count = 0
-    for v in data:
-        tipo = get_tipo_dato(v)
-        if tipo == prev_tipo:
-            streak_count += 1
-        else:
-            if prev_tipo is not None:
-                if prev_tipo == 'low':
-                    max_low = max(max_low, streak_count)
-                elif prev_tipo == 'mid':
-                    max_mid = max(max_mid, streak_count)
-                else:
-                    max_high = max(max_high, streak_count)
-            streak_count = 1
-            prev_tipo = tipo
-    if prev_tipo is not None:
-        if prev_tipo == 'low':
-            max_low = max(max_low, streak_count)
-        elif prev_tipo == 'mid':
-            max_mid = max(max_mid, streak_count)
-        else:
-            max_high = max(max_high, streak_count)
-    return {'currentType': current_type, 'currentLength': current_streak - 1,
-            'maxLow': max_low, 'maxMid': max_mid, 'maxHigh': max_high}
-
-def calcular_probabilidad_condicional(data: List[float]) -> dict:
-    result = {'after3Low': 0.0, 'after2High': 0.0, 'afterStreak5Low': 0.0}
-    n = len(data)
-    if n < 10:
-        return result
-    a = at = 0
-    for i in range(3, n):
-        if data[i - 1] < 2 and data[i - 2] < 2 and data[i - 3] < 2:
-            at += 1
-            if data[i] >= 2:
-                a += 1
-    result['after3Low'] = (a / at * 100) if at > 0 else 0.0
-    b = bt = 0
-    for i in range(2, n):
-        if data[i - 1] >= 2 and data[i - 2] >= 2:
-            bt += 1
-            if data[i] < 2:
-                b += 1
-    result['after2High'] = (b / bt * 100) if bt > 0 else 0.0
-    c = ct = 0
-    for i in range(5, n):
-        all_low = all(data[i - j] < 2 for j in range(1, 6))
-        if all_low:
-            ct += 1
-            if data[i] >= 2:
-                c += 1
-    result['afterStreak5Low'] = (c / ct * 100) if ct > 0 else 0.0
-    return result
-
-def calcular_estadisticas_avanzadas(data: List[float]) -> dict:
-    n = len(data)
-    mean = sum(data) / n
-    variance = sum((v - mean) ** 2 for v in data) / n
-    std_dev = variance ** 0.5
-    streaks = calcular_rachas(data)
-    cond = calcular_probabilidad_condicional(data)
-    slope, r2 = calcular_regresion_lineal(data)
-    return {'mean': mean, 'stdDev': std_dev, 'variance': variance,
-            'slope': slope, 'r2': r2, 'streaks': streaks, 'conditionalProb': cond}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENTE 6 — BLOQUES / RACHAS DE BAJOS
-# ═══════════════════════════════════════════════════════════════════════════
-def obtener_rango_agente6(v: float) -> str:
-    if v < 1.50: return 'muyBajo'
-    if v < 2.00: return 'bajo'
-    if v < 10.00: return 'medio'
-    if v < 50.00: return 'alto'
-    return 'muyAlto'
-
-def calcular_rachas_agente6(lista: List[float]):
-    racha_temp = 0
-    racha_max = 0
-    for v in lista:
-        if v < 2.00:
-            racha_temp += 1
-            racha_max = max(racha_max, racha_temp)
-        else:
-            racha_temp = 0
-    racha_actual = 0
-    for v in reversed(lista):
-        if v < 2.00:
-            racha_actual += 1
-        else:
-            break
-    return racha_actual, racha_max
-
-def generar_recomendacion_agente6(vals: List[float]) -> dict:
-    if len(vals) < 30:
-        return {'tipo': 'analizando', 'racha': 0, 'totalBajos30': 0.0}
-    bloque30 = vals[-30:]
-    conteo = {'muyBajo': 0, 'bajo': 0, 'medio': 0, 'alto': 0, 'muyAlto': 0}
-    for v in bloque30:
-        conteo[obtener_rango_agente6(v)] += 1
-    total = len(bloque30)
-    total_bajos30 = (conteo['muyBajo'] + conteo['bajo']) / total * 100
-    racha_actual, _ = calcular_rachas_agente6(vals)
-    if racha_actual >= 4 and total_bajos30 > 60:
-        tipo = 'segura'
-    elif racha_actual >= 3 and 50 <= total_bajos30 <= 60:
-        tipo = 'moderada'
-    elif total_bajos30 < 45 or racha_actual < 2:
-        tipo = 'esperar'
-    else:
-        tipo = 'analizando'
-    return {'tipo': tipo, 'racha': racha_actual, 'totalBajos30': total_bajos30}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENTE 7 — RACHAS DE RANGO
-# ═══════════════════════════════════════════════════════════════════════════
-def obtener_rango(v: float) -> str:
-    if v < 1.50: return 'muyBajo'
-    if v < 2.00: return 'bajo'
-    if v < 4.00: return 'medio'
-    if v < 10.00: return 'medioAlto'
-    return 'alto'
-
-def detectar_rachas_rango(vals: List[float]):
-    if len(vals) < UMBRAL_ACTIVACION:
-        return False, None, {}
-    racha_actual = 1
-    rango_actual = obtener_rango(vals[-1])
-    start = max(0, len(vals) - 10)
-    i = len(vals) - 2
-    while i >= start:
-        if obtener_rango(vals[i]) == rango_actual and vals[i + 1] > vals[i]:
-            racha_actual += 1
-            i -= 1
-        else:
-            break
-    rangos_racha = {rango_actual: racha_actual}
-    racha_rango_activa = racha_actual >= 3
-    rango_activo = rango_actual if racha_rango_activa else None
-    return racha_rango_activa, rango_activo, rangos_racha
-
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENTE 8 — FUERZA / VELOCIDAD
-# ═══════════════════════════════════════════════════════════════════════════
-def calcular_fuerza(vals: List[float]):
-    if len(vals) < UMBRAL_ACTIVACION:
-        return None
-    v1, v2, v3 = vals[-3], vals[-2], vals[-1]
-    velocidad = ((v2 - v1) + (v3 - v2)) / 2
-    tendencia = 0.0
-    if len(vals) >= 10:
-        reciente, antiguo = vals[-5:], vals[-10:-5]
-        f_r = sum(reciente[i] - reciente[i - 1] for i in range(1, len(reciente)))
-        f_a = sum(antiguo[i] - antiguo[i - 1] for i in range(1, len(antiguo)))
-        tendencia = f_r - f_a
-    return {'velocidad': velocidad, 'tendencia': tendencia}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SISTEMA DE 8 AGENTES — SOLO COMO FILTRO INTERNO
-# ═══════════════════════════════════════════════════════════════════════════
-def ejecutar_multiagente(vals, niveles, ema4, ema8, ema20, ema50, rsi, macd, fib,
-                         sr_strong, stats, agente6, racha_rango_activa,
-                         rango_activo, rangos_racha, fuerza, ia_prob):
-    current = niveles[-1]
-    risk_score = 0
-    votos: Dict[str, str] = {}
-    
-    if ema4 and ema8 and ema50:
-        e4, e8, e50 = ema4[-1], ema8[-1], ema50[-1]
-        if e4 > e8 and e8 > e50:
-            votos['a1'] = 'ENTRAR'
-        elif e4 > e8:
-            votos['a1'] = 'ENTRAR'
-        elif e4 < e8 and e8 < e50:
-            votos['a1'] = 'NO_ENTRAR'; risk_score += 3
-        else:
-            votos['a1'] = 'ESPERAR'; risk_score += 1
-    else:
-        votos['a1'] = 'ESPERAR'
-    
-    a2 = 0
-    if sr_strong.get('soporte') is not None and abs(current - sr_strong['soporte']) <= 1.5:
-        a2 += 4
-    if sr_strong.get('resistencia') is not None and abs(current - sr_strong['resistencia']) <= 1.5:
-        a2 -= 3; risk_score += 4
-    if ema20:
-        linea_media = ema20[-1]
-        distancia = abs(current - linea_media)
-        if distancia <= 0.5 and current > linea_media:
-            a2 += 2
-        elif distancia <= 0.5 and current < linea_media:
-            a2 -= 2; risk_score += 2
-    votos['a2'] = 'ENTRAR' if a2 >= 3 else ('NO_ENTRAR' if a2 <= -2 else 'ESPERAR')
-    
-    last5 = vals[-5:]
-    avg_last5 = sum(last5) / 5
-    prev5 = vals[-10:-5]
-    avg_prev5 = (sum(prev5) / len(prev5)) if prev5 else avg_last5
-    low_count = sum(1 for v in last5 if v < 2.0)
-    a3 = 0
-    if low_count >= 3 and avg_last5 < 2.0:
-        a3 += 3
-    elif avg_last5 > avg_prev5 * 1.2:
-        a3 += 2
-    else:
-        risk_score += 1
-    if a3 >= 3:
-        votos['a3'] = 'ENTRAR'
-    elif a3 <= 0 and risk_score > 2:
-        votos['a3'] = 'NO_ENTRAR'
-    else:
-        votos['a3'] = 'ESPERAR'
-    
-    a4 = 0
-    if rsi:
-        r = rsi[-1]
-        if 40 <= r <= 65:
-            a4 += 2
-        elif r < 30:
-            a4 += 3
-        elif r > 75:
-            a4 -= 4; risk_score += 4
-    if len(macd) > 1:
-        if macd[-1] > 0 and macd[-1] > macd[-2]:
-            a4 += 2
-        elif macd[-1] < 0:
-            a4 -= 2; risk_score += 2
-    if fib:
-        fib618 = fib.get('61.8%')
-        if fib618 is not None and abs(current - fib618) < 0.5:
-            a4 += 2
-    votos['a4'] = 'ENTRAR' if a4 >= 3 else ('NO_ENTRAR' if a4 <= -2 else 'ESPERAR')
-    
-    if stats is not None:
-        a5 = 0
-        slope, r2 = stats['slope'], stats['r2']
-        if slope > 0.05 and r2 > 0.3:
-            a5 += 3
-        elif slope < -0.05 and r2 > 0.3:
-            a5 -= 3; risk_score += 3
-        streak = stats['streaks']
-        if streak['currentType'] == 'low' and streak['currentLength'] >= 3:
-            prob = stats['conditionalProb']['after3Low']
-            a5 += 4 if prob > 50 else 2
-        elif streak['currentType'] == 'high' and streak['currentLength'] >= 2:
-            a5 -= 2; risk_score += 2
-        current_val = vals[-1]
-        z = (current_val - stats['mean']) / stats['stdDev'] if stats['stdDev'] > 0 else 0
-        if z < -1.5:
-            a5 += 2
-        elif z > 2:
-            a5 -= 3; risk_score += 3
-        if stats['conditionalProb']['afterStreak5Low'] > 65:
-            a5 += 3
-        votos['a5'] = 'ENTRAR' if a5 >= 3 else ('NO_ENTRAR' if a5 <= -2 else 'ESPERAR')
-    else:
-        votos['a5'] = 'ESPERAR'
-    
-    if agente6 is not None:
-        tipo = agente6['tipo']
-        if tipo in ('segura', 'moderada'):
-            votos['a6'] = 'ENTRAR'
-        elif tipo == 'esperar':
-            votos['a6'] = 'NO_ENTRAR'; risk_score += 2
-        else:
-            votos['a6'] = 'ESPERAR'
-    else:
-        votos['a6'] = 'ESPERAR'
-    
-    if rangos_racha:
-        a7 = 0
-        if racha_rango_activa and rango_activo:
-            racha = rangos_racha.get(rango_activo, 0)
-            if rango_activo in ('muyBajo', 'bajo'):
-                a7 += 5 if racha >= 4 else 3
-            elif rango_activo == 'medio':
-                a7 += 4
-            elif rango_activo == 'medioAlto':
-                a7 += 2
-            else:
-                a7 -= 2; risk_score += 2
-        votos['a7'] = 'ENTRAR' if a7 >= 3 else ('NO_ENTRAR' if a7 <= -1 else 'ESPERAR')
-    else:
-        votos['a7'] = 'ESPERAR'
-    
-    if fuerza is not None:
-        a8 = 0
-        vel, ten = fuerza['velocidad'], fuerza['tendencia']
-        if vel > 1.5 and ten > 0:
-            a8 += 5
-        elif vel > 0.5 and ten >= 0:
-            a8 += 3
-        elif vel > 0:
-            a8 += 1
-        elif vel < -1.0:
-            a8 -= 3; risk_score += 2
-        if ia_prob is not None:
-            if ia_prob > 65:
-                a8 += 2
-            elif ia_prob < 35:
-                a8 -= 2; risk_score += 1
-        votos['a8'] = 'ENTRAR' if a8 >= 3 else ('NO_ENTRAR' if a8 <= -2 else 'ESPERAR')
-    else:
-        votos['a8'] = 'ESPERAR'
-    
-    contar_entrar    = sum(1 for v in votos.values() if v == 'ENTRAR')
-    contar_no_entrar = sum(1 for v in votos.values() if v == 'NO_ENTRAR')
-    return contar_entrar, contar_no_entrar, risk_score, votos
-
-def agentes_bloquean_señal(contar_no_entrar, risk_score) -> bool:
-    if risk_score >= 7:
-        return True
-    if contar_no_entrar >= 5:
-        return True
-    return False
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MOTOR DE ESTRATEGIA v17
-# ═══════════════════════════════════════════════════════════════════════════
-class HtmlEngine:
-    def __init__(self):
-        self.tendencia_estado = 'ROJO'
-        self.last_video_idx   = -999
-        self.last_combo_idx   = -999
-        self.last_martillo_idx = -999
-        self.fuerza_memoria   = []
-    
-    def evaluar(self, vals: List[float]):
-        if len(vals) < 3:
-            return None
-        niveles = compute_niveles(vals)
-        ema4  = ema_html(4, niveles)
-        ema8  = ema_html(8, niveles)
-        ema20 = ema_html(20, niveles)
-        ema50 = ema_html(50, niveles)
-        confidence = calcular_confianza(vals)
-        idx = len(vals) - 1
-        
-        nuevo = calcular_tendencia_lucky(vals, niveles)
-        self.tendencia_estado = nuevo
-        
-        sr_strong = calcular_soporte_resistencia_fuerte(niveles)
-        rsi  = calcular_rsi(niveles)
-        macd = calcular_macd(niveles)
-        fib  = calcular_fibonacci(niveles)
-        
-        stats = agente6 = None
-        racha_rango_activa = False
-        rango_activo = None
-        rangos_racha = {}
-        fuerza = None
-        ia_prob = None
-        
-        if len(vals) >= UMBRAL_ACTIVACION:
-            stats = calcular_estadisticas_avanzadas(vals)
-            agente6 = generar_recomendacion_agente6(vals)
-            racha_rango_activa, rango_activo, rangos_racha = detectar_rachas_rango(vals)
-            fuerza = calcular_fuerza(vals)
-            if fuerza is not None and len(vals) >= 5:
-                self.fuerza_memoria.append({
-                    'fuerza': vals[-4] - vals[-5],
-                    'resultado': 'alto' if vals[-1] >= 2.0 else 'bajo'
-                })
-                if len(self.fuerza_memoria) > 500:
-                    self.fuerza_memoria = self.fuerza_memoria[-500:]
-                if len(self.fuerza_memoria) >= 10:
-                    fa_a = fa_t = 0
-                    for i in range(1, len(self.fuerza_memoria)):
-                        if self.fuerza_memoria[i - 1]['fuerza'] > 1.0:
-                            fa_t += 1
-                            if self.fuerza_memoria[i]['resultado'] == 'alto':
-                                fa_a += 1
-                    if fa_t > 0:
-                        ia_prob = (fa_a / fa_t) * 100
-        
-        contar_entrar, contar_no_entrar, risk_score, votos = ejecutar_multiagente(
-            vals, niveles, ema4, ema8, ema20, ema50, rsi, macd, fib, sr_strong,
-            stats, agente6, racha_rango_activa, rango_activo, rangos_racha, fuerza, ia_prob
-        )
-        
-        if agentes_bloquean_señal(contar_no_entrar, risk_score):
-            logger.info(f"[v17] 🛑 Agentes bloquean señales: risk={risk_score} no_entrar={contar_no_entrar}")
-            return None
-        
-        agresiva_condicion = False
-        max_rec = max(vals[-10:]) if len(vals) >= 10 else (max(vals) if vals else 0)
-        agresiva_condicion = max_rec >= UMBRAL_AGRESIVO_V2
-        
-        features_base = {
-            'idx': idx,
-            'ultimo_valor': vals[-1],
-            'confidence': confidence,
-            'tendencia_lucky': nuevo,
-            'agresiva_condicion': agresiva_condicion,
-            'ema4': ema4[-1] if ema4 else None,
-            'ema8': ema8[-1] if ema8 else None,
-            'ema20': ema20[-1] if ema20 else None,
-            'ema50': ema50[-1] if ema50 else None,
-            'votos': votos,
-            'contar_entrar': contar_entrar,
-            'contar_no_entrar': contar_no_entrar,
-            'risk_score': risk_score,
-            'rsi': rsi[-1] if rsi else None,
-            'macd': macd[-1] if macd else None,
-            'fuerza': fuerza,
-            'ia_prob': ia_prob,
-            'racha_rango_activa': racha_rango_activa,
-            'rango_activo': rango_activo,
-        }
-        
-        candidatos = []
-        
-        if nuevo == 'VERDE' and agresiva_condicion and filtro_v2_combo(vals, ema4, ema8):
-            self.last_combo_idx = idx
-            candidatos.append(('combo_verde_agresiva', ALERT_LABELS['combo_verde_agresiva'],
-                               f'Tendencia VERDE + máx≥{UMBRAL_AGRESIVO_V2}x + EMA4>EMA8',
-                               dict(features_base)))
-        
-        if len(vals) >= 5:
-            conf = int(confidence)
-            if CONF_ALERTA_MIN <= conf <= CONF_ALERTA_MAX and filtro_v1_video(vals, ema8):
-                self.last_video_idx = idx
-                candidatos.append(('video', ALERT_LABELS['video'],
-                                   f'Confianza {conf}% + últimos 3 < 2x + EMA8 subiendo',
-                                   dict(features_base)))
-        
-        if detectar_martillo_base(vals, ema8) and filtro_v3_martillo(vals, ema8):
-            self.last_martillo_idx = idx
-            candidatos.append(('martillo', ALERT_LABELS['martillo'],
-                               f'Martillo + valle<{UMBRAL_VALLE_V3}x + EMA8 subiendo 3 periodos',
-                               dict(features_base)))
-        
-        if not candidatos:
-            return None
-        
-        elegido = self._elegir_mejor(candidatos)
-        if elegido is None:
-            return None
-        
-        tipo_key, label, motivo, features = elegido
-        
-        es_inmediata = False
-        if tipo_key == 'video':
-            if es_v1_video_alta_confianza(vals, ema8, rsi):
-                if agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_score):
-                    es_inmediata = True
-                    features['emision_inmediata'] = True
-                    features['emision_inmediata_v1'] = True
-                    motivo += f' | 🚀 INMEDIATA (V1: racha≥{RACHA_BAJOS_MIN_INMEDIATA_V1}, EMA8×3, RSI≤{RSI_OVERSOLD_V1})'
-                    logger.info(f"[v17] 🚀 Emisión inmediata V1 activada: racha_bajos≥{RACHA_BAJOS_MIN_INMEDIATA_V1}, RSI≤{RSI_OVERSOLD_V1}")
-        elif tipo_key == 'martillo':
-            if es_v3_martillo_alta_confianza(vals, ema8, rsi):
-                if agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_score):
-                    es_inmediata = True
-                    features['emision_inmediata'] = True
-                    features['emision_inmediata_v3'] = True
-                    motivo += f' | 🚀 INMEDIATA (V3: valle<{VALLE_MIN_INMEDIATA_V3}, rebote≥{REBOTE_MIN_INMEDIATA_V3}x, EMA8×4, RSI {RSI_RECUP_MIN_V3}-{RSI_RECUP_MAX_V3})'
-                    logger.info(f"[v17] 🚀 Emisión inmediata V3 activada: valle<{VALLE_MIN_INMEDIATA_V3}, rebote≥{REBOTE_MIN_INMEDIATA_V3}x, RSI {RSI_RECUP_MIN_V3}-{RSI_RECUP_MAX_V3}")
-        elif tipo_key == 'combo_verde_agresiva':
-            if es_v2_combo_alta_confianza(vals, ema4, ema8, rsi):
-                if agentes_permiten_emision_inmediata(contar_entrar, contar_no_entrar, risk_score):
-                    es_inmediata = True
-                    features['emision_inmediata'] = True
-                    features['emision_inmediata_v2'] = True
-                    motivo += f' | 🚀 INMEDIATA (V2: pico≥{AGRESIVO_MIN_INMEDIATA_V2}x, EMA4-EMA8≥{MARGEN_EMA4_EMA8_INMEDIATA_V2}, RSI {RSI_MIN_INMEDIATA_V2}-{RSI_MAX_INMEDIATA_V2})'
-                    logger.info(f"[v17] 🚀 Emisión inmediata V2 activada: pico≥{AGRESIVO_MIN_INMEDIATA_V2}x, RSI {RSI_MIN_INMEDIATA_V2}-{RSI_MAX_INMEDIATA_V2}")
-        
-        return tipo_key, label, motivo, json.dumps(features, default=str), es_inmediata
-    
-    def _elegir_mejor(self, candidatos: list):
-        if ml_model is None:
-            return candidatos[0]
-        mejor = None
-        mejor_prob = -1.0
-        for cand in candidatos:
-            tipo_key, label, motivo, features = cand
-            prob = predict_prob(tipo_key, features)
-            if prob is None:
-                prob = MODEL_MIN_PROB
-            features['ml_prob'] = round(prob, 4)
-            if prob >= MODEL_MIN_PROB and prob > mejor_prob:
-                mejor = cand
-                mejor_prob = prob
-        return mejor
-
-engine = HtmlEngine()
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ML — FEATURIZACIÓN (SEÑAL)
+# ML — FEATURIZACIÓN E INFERENCIA
 # ═══════════════════════════════════════════════════════════════════════════
 CATEGORICAL_COLUMNS = [
-    'tipo_key',
-    'tendencia_lucky',
-    'rango_activo',
+    'tipo_key', 'tendencia_lucky', 'rango_activo',
     'voto_a1', 'voto_a2', 'voto_a3', 'voto_a4',
     'voto_a5', 'voto_a6', 'voto_a7', 'voto_a8',
 ]
@@ -1335,7 +943,7 @@ CATEGORICAL_COLUMNS = [
 def flatten_features(tipo_key: str, features: dict) -> dict:
     flat = dict(features)
     votos = flat.pop('votos', None) or {}
-    for agente in ('a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8'):
+    for agente in ('a1','a2','a3','a4','a5','a6','a7','a8'):
         flat[f'voto_{agente}'] = votos.get(agente)
     fuerza = flat.pop('fuerza', None)
     if isinstance(fuerza, dict):
@@ -1344,102 +952,14 @@ def flatten_features(tipo_key: str, features: dict) -> dict:
     else:
         flat['fuerza_velocidad'] = None
         flat['fuerza_tendencia'] = None
-    for bool_col in ('agresiva_condicion', 'racha_rango_activa', 'emision_inmediata'):
+    for bool_col in ('agresiva_condicion','racha_rango_activa','emision_inmediata',
+                     'cruce_alcista','alineacion_alcista','linea_5x_activa','linea_10x_activa'):
         if bool_col in flat and flat[bool_col] is not None:
             flat[bool_col] = int(bool(flat[bool_col]))
     flat.pop('ml_prob', None)
     flat['tipo_key'] = tipo_key
     return flat
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ML — CONTEXTO DE SEÑAL (para ML de Timing Dinámico)
-# ═══════════════════════════════════════════════════════════════════════════
-def extract_context_features(history_vals: List[float], signal_features: dict) -> dict:
-    """
-    Extrae features de contexto en tiempo real para el ML de Timing.
-    Incluye: últimas 20 rondas, rachas, indicadores, features de la señal.
-    """
-    context = {}
-    
-    # Últimas CONTEXT_WINDOW cuotas (valores crudos)
-    window = history_vals[-CONTEXT_WINDOW:] if len(history_vals) >= CONTEXT_WINDOW else history_vals
-    for i, v in enumerate(window):
-        context[f'ctx_val_{i}'] = v
-    
-    # Features agregadas de las últimas 5, 10, 20 rondas
-    for n in [5, 10, 20]:
-        if len(history_vals) >= n:
-            subset = history_vals[-n:]
-            context[f'ctx_mean_{n}'] = sum(subset) / n
-            context[f'ctx_max_{n}'] = max(subset)
-            context[f'ctx_min_{n}'] = min(subset)
-            context[f'ctx_std_{n}'] = (sum((v - context[f'ctx_mean_{n}'])**2 for v in subset) / n) ** 0.5
-            context[f'ctx_count_low_{n}'] = sum(1 for v in subset if v < 2.0)
-            context[f'ctx_count_high_{n}'] = sum(1 for v in subset if v >= 2.0)
-        else:
-            context[f'ctx_mean_{n}'] = 0.0
-            context[f'ctx_max_{n}'] = 0.0
-            context[f'ctx_min_{n}'] = 0.0
-            context[f'ctx_std_{n}'] = 0.0
-            context[f'ctx_count_low_{n}'] = 0
-            context[f'ctx_count_high_{n}'] = 0
-    
-    # Rachas actuales
-    racha_bajos = 0
-    for v in reversed(history_vals):
-        if v < 2.0:
-            racha_bajos += 1
-        else:
-            break
-    context['ctx_racha_bajos_actual'] = racha_bajos
-    
-    racha_altos = 0
-    for v in reversed(history_vals):
-        if v >= 2.0:
-            racha_altos += 1
-        else:
-            break
-    context['ctx_racha_altos_actual'] = racha_altos
-    
-    # Distancia a EMA8 actual
-    if len(history_vals) >= 8:
-        niveles = compute_niveles(history_vals)
-        ema8 = ema_html(8, niveles)
-        if ema8:
-            context['ctx_dist_ema8'] = history_vals[-1] - ema8[-1]
-        else:
-            context['ctx_dist_ema8'] = 0.0
-    else:
-        context['ctx_dist_ema8'] = 0.0
-    
-    # RSI actual
-    if len(history_vals) >= 15:
-        niveles = compute_niveles(history_vals)
-        rsi = calcular_rsi(niveles)
-        context['ctx_rsi'] = rsi[-1] if rsi else 50.0
-    else:
-        context['ctx_rsi'] = 50.0
-    
-    # MACD actual
-    if len(history_vals) >= 26:
-        niveles = compute_niveles(history_vals)
-        macd = calcular_macd(niveles)
-        context['ctx_macd'] = macd[-1] if macd else 0.0
-    else:
-        context['ctx_macd'] = 0.0
-    
-    # Features de la señal (aplanadas)
-    signal_flat = flatten_features(signal_features.get('tipo_key', 'desconocido'), signal_features)
-    for k, v in signal_flat.items():
-        if k != 'tipo_key':
-            context[f'sig_{k}'] = v
-    
-    # Agregar tipo_key como categorical
-    context['tipo_key'] = signal_features.get('tipo_key', 'desconocido')
-    
-    return context
-
-# ─── ML — INFERENCIA (SEÑAL) ──────────────────────────────────────────────────
 ml_model = None
 ml_feature_columns: List[str] = []
 ml_categorical_columns: List[str] = []
@@ -1448,10 +968,10 @@ ml_last_trained_count: int = 0
 def load_ml_model():
     global ml_model, ml_feature_columns, ml_categorical_columns
     if not ML_LIBS_OK:
-        logger.warning("[ML] joblib/pandas no instalados — filtro ML desactivado.")
+        logger.warning("[ML] joblib/pandas no instalados.")
         return
     if not os.path.exists(MODEL_FILE):
-        logger.info(f"[ML] No se encontró '{MODEL_FILE}' — filtro ML desactivado.")
+        logger.info(f"[ML] No se encontró '{MODEL_FILE}'.")
         return
     try:
         artifact = joblib.load(MODEL_FILE)
@@ -1488,9 +1008,7 @@ def predict_prob(tipo_key: str, features: dict) -> Optional[float]:
         logger.warning(f"[ML] Error prediciendo: {e}")
         return None
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ML — TIMING MODEL DINÁMICO (aprende en qué intento emitir)
-# ═══════════════════════════════════════════════════════════════════════════
+# ─── ML — TIMING MODEL ────────────────────────────────────────────────────
 timing_model = None
 timing_feature_columns: List[str] = []
 timing_categorical_columns: List[str] = []
@@ -1499,10 +1017,10 @@ timing_last_trained_count: int = 0
 def load_timing_model():
     global timing_model, timing_feature_columns, timing_categorical_columns
     if not ML_LIBS_OK:
-        logger.warning("[Timing ML] joblib/pandas no instalados — modelo de timing desactivado.")
+        logger.warning("[Timing ML] joblib/pandas no instalados.")
         return
     if not os.path.exists(TIMING_MODEL_FILE):
-        logger.info(f"[Timing ML] No se encontró '{TIMING_MODEL_FILE}' — modelo de timing desactivado.")
+        logger.info(f"[Timing ML] No se encontró '{TIMING_MODEL_FILE}'.")
         return
     try:
         artifact = joblib.load(TIMING_MODEL_FILE)
@@ -1515,10 +1033,6 @@ def load_timing_model():
         timing_model = None
 
 def predict_timing(context_features: dict) -> Optional[Dict[str, float]]:
-    """
-    Predice la probabilidad de ganar en cada intento (1, 2, 3, 4) o perder.
-    Retorna: {'win_1': prob, 'win_2': prob, 'win_3': prob, 'win_4': prob, 'loss': prob}
-    """
     if timing_model is None:
         return None
     try:
@@ -1541,57 +1055,45 @@ def predict_timing(context_features: dict) -> Optional[Dict[str, float]]:
         classes = timing_model.classes_
         result = {}
         for i, cls in enumerate(classes):
-            if cls == 1:
-                result['win_1'] = float(probs[i])
-            elif cls == 2:
-                result['win_2'] = float(probs[i])
-            elif cls == 3:
-                result['win_3'] = float(probs[i])
-            elif cls == 4:
-                result['win_4'] = float(probs[i])
-            elif cls == 0:
-                result['loss'] = float(probs[i])
+            if cls == 1: result['win_1'] = float(probs[i])
+            elif cls == 2: result['win_2'] = float(probs[i])
+            elif cls == 3: result['win_3'] = float(probs[i])
+            elif cls == 4: result['win_4'] = float(probs[i])
+            elif cls == 0: result['loss'] = float(probs[i])
         return result
     except Exception as e:
         logger.warning(f"[Timing ML] Error prediciendo: {e}")
         return None
 
+def elegir_ronda_entrada(timing_pred: Optional[Dict[str, float]]) -> tuple:
+    """Aprende, con el modelo de timing (entrenado sobre attempt_when_win de
+    signal_contexts), en qué ronda de la sesión conviene más entrar: 1, 2 o 3.
+    Sin modelo entrenado todavía, asume ronda 1 (entrada inmediata) con
+    confianza neutra, para no bloquear señales antes de tener datos."""
+    if not timing_pred:
+        return 1, 1.0
+    candidatos = {
+        1: timing_pred.get('win_1', 0.0),
+        2: timing_pred.get('win_2', 0.0),
+        3: timing_pred.get('win_3', 0.0),
+    }
+    mejor_ronda = max(candidatos, key=candidatos.get)
+    return mejor_ronda, candidatos[mejor_ronda]
+
 def decide_emit_attempt(timing_pred: Optional[Dict[str, float]], es_inmediata: bool) -> int:
-    """
-    Decide en qué intento emitir la señal basado en las predicciones del modelo de timing.
-    El ML ajusta dinámicamente la ronda según el contexto en tiempo real.
-    """
-    if es_inmediata:
-        return 1
-    
     if timing_pred is None:
-        return 2  # Default: intento 2
-    
-    win_1 = timing_pred.get('win_1', 0.0)
-    win_2 = timing_pred.get('win_2', 0.0)
-    win_3 = timing_pred.get('win_3', 0.0)
-    win_4 = timing_pred.get('win_4', 0.0)
+        return 1
     loss = timing_pred.get('loss', 0.0)
-    
-    # Si la probabilidad de pérdida es muy alta, no emitir
     if loss > 0.6:
         logger.info(f"[Timing ML] ❌ Alta probabilidad de pérdida ({loss:.2%}) — no emitir")
         return 0
-    
-    # Elegir el intento con mayor probabilidad de ganar
-    attempts_probs = {1: win_1, 2: win_2, 3: win_3, 4: win_4}
-    best_attempt = max(attempts_probs, key=attempts_probs.get)
-    best_prob = attempts_probs[best_attempt]
-    
-    if best_prob < TIMING_MIN_PROB:
-        logger.info(f"[Timing ML] ⚠️ Probabilidad muy baja ({best_prob:.2%}) — no emitir")
+    _, mejor_prob = elegir_ronda_entrada(timing_pred)
+    if mejor_prob < TIMING_MIN_PROB:
+        logger.info(f"[Timing ML] ⚠️ Probabilidad muy baja ({mejor_prob:.2%}) — no emitir")
         return 0
-    
-    logger.info(f"[Timing ML] 🎯 Emitir en intento {best_attempt} (prob={best_prob:.2%}) | "
-                f"win_1={win_1:.2%}, win_2={win_2:.2%}, win_3={win_3:.2%}, win_4={win_4:.2%}")
-    return best_attempt
+    return 1
 
-# ─── ML — AUTO-ENTRENAMIENTO (SEÑAL) ──────────────────────────────────────────
+# ─── AUTO-ENTRENAMIENTO ──────────────────────────────────────────────────────
 def count_resolved_signals() -> int:
     try:
         con = _db()
@@ -1645,7 +1147,6 @@ def train_model_in_thread(min_rows: int):
     except Exception as e:
         return False, None, f"error entrenando: {e}"
 
-# ─── ML — AUTO-ENTRENAMIENTO (TIMING) ─────────────────────────────────────────
 def count_resolved_contexts() -> int:
     try:
         con = _db()
@@ -1697,11 +1198,7 @@ def train_timing_model_in_thread(min_rows: int):
 async def auto_train_loop():
     global ml_model, ml_feature_columns, ml_categorical_columns, ml_last_trained_count
     global timing_model, timing_feature_columns, timing_categorical_columns, timing_last_trained_count
-    if not AUTO_TRAIN_ENABLED:
-        logger.info("[ML] Auto-entrenamiento desactivado.")
-        return
-    if not ML_LIBS_OK:
-        logger.warning("[ML] Auto-entrenamiento desactivado: faltan libs.")
+    if not AUTO_TRAIN_ENABLED or not ML_LIBS_OK:
         return
     logger.info(
         f"[ML] Auto-entrenamiento activo — cada {AUTO_TRAIN_INTERVAL_SEC}s "
@@ -1748,232 +1245,363 @@ async def auto_train_loop():
         except Exception as e:
             logger.warning(f"[ML] Error en auto-entrenamiento: {e}")
 
-# ─── MENSAJES ─────────────────────────────────────────────────────────────────
-def build_signal_msg(tipo_label: str, last_value: float, es_inmediata: bool = False,
-                     emit_attempt: int = 2) -> str:
-    if es_inmediata:
-        header = "<b>🚨🚨 ENTRADA INMEDIATA 🚨🚨</b>"
-    else:
-        header = f"<b>✅✅ ENTRADA CONFIRMADA ✅✅</b>"
-    return (
-        f"{header}\n\n"
-        f"<b>🧠 {tipo_label}</b>\n"
-        f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
-        f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n"
-        f"<i>💫 ¡Juegue con Responsabilidad!</i>\n"
-        f'🎰 <a href="{GAME_LINK}">Acceder al Spaceman</a>'
-    )
+# ─── FUNCIONES DE CARGA DE DATOS PARA ENTRENAMIENTO ────────────────────────
+def cargar_datos_entrenamiento(db_path: str):
+    if not os.path.exists(db_path):
+        sys.exit(f"No se encontró la base: {db_path}")
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT tipo_key, result, features_json FROM pattern_stats "
+        "WHERE features_json IS NOT NULL AND result IN ('win','loss')"
+    ).fetchall()
+    con.close()
+    registros = []
+    for row in rows:
+        try:
+            features = json.loads(row["features_json"])
+        except (TypeError, ValueError):
+            continue
+        flat = flatten_features(row["tipo_key"], features)
+        flat["_target"] = 1 if row["result"] == "win" else 0
+        registros.append(flat)
+    return pd.DataFrame(registros)
 
-def build_stats_result_msg(result: float, tipo_label: str, intento: int, win: bool) -> str:
-    if not win:
-        return "🚫 LOSS."
-    if intento == 1:
-        return "✅ WIN 1 EXP."
-    elif intento == 2:
-        return "✅ WIN 2."
-    else:
-        return f"✅ WIN {intento}."
+def construir_matriz_entrenamiento(df):
+    y = df["_target"].astype(int)
+    x_raw = df.drop(columns=["_target"])
+    cat_cols_presentes = [c for c in CATEGORICAL_COLUMNS if c in x_raw.columns]
+    x = pd.get_dummies(x_raw, columns=cat_cols_presentes, dummy_na=False)
+    x = x.select_dtypes(include=["number", "bool"]).astype(float)
+    return x, y, cat_cols_presentes
 
-def build_win_msg(result: float, tipo_label: str, intento: int) -> str:
-    return (
-        "<b>🍀🍀🍀 GANAMOS!!! 🍀🍀🍀</b>\n"
-        f"<b>✅ Resultado: {result:.2f}x — {tipo_label}</b>"
-    )
+TIMING_CATEGORICAL_COLUMNS = ['tipo_key']
 
-def build_loss_msg(result: float, tipo_label: str, intento: int) -> str:
-    return (
-        "<b>🔴 PERDIMOS!!! 🔴</b>\n"
-        f"<b>❌ Resultado: {result:.2f}x — {tipo_label}</b>"
-    )
+def cargar_datos_timing(db_path: str):
+    if not os.path.exists(db_path):
+        sys.exit(f"No se encontró la base: {db_path}")
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT signal_id, tipo_key, trigger_value, attempt_when_win, result, context_json "
+        "FROM signal_contexts WHERE context_json IS NOT NULL AND result IN ('win','loss')"
+    ).fetchall()
+    con.close()
+    registros = []
+    for row in rows:
+        try:
+            context = json.loads(row["context_json"])
+        except (TypeError, ValueError):
+            continue
+        flat = dict(context)
+        if row["result"] == "loss":
+            flat["_target"] = 0
+        else:
+            attempt = row["attempt_when_win"]
+            if attempt in (1,2,3,4):
+                flat["_target"] = attempt
+            else:
+                flat["_target"] = 0
+        registros.append(flat)
+    return pd.DataFrame(registros)
 
-def build_stats_msg() -> str:
-    total = daily_wins + daily_losses
-    pct = (daily_wins / total * 100) if total > 0 else 0.0
-    return (
-        f"🚀 <b>Resultado del día ✅ {daily_wins} | ⭕ {daily_losses}</b>\n"
-        f"💎 <b>Acertamos el {pct:.2f}% de las Señales</b>\n"
-        f"📈 <b>¡{consecutive_wins} Sesiones Ganadas Consecutivas!</b>"
-    )
-
-# ─── STATS UPDATE ────────────────────────────────────────────────────────────
-async def send_stats_update():
-    global stats_msg_id
-    if sig_state != "idle":
-        return
-    if stats_msg_id:
-        await delete_msg(stats_msg_id)
-    stats_msg_id = await send_signal_msg(build_stats_msg())
-    save_state()
+def construir_matriz_timing(df):
+    y = df["_target"].astype(int)
+    x_raw = df.drop(columns=["_target"])
+    cat_cols_presentes = [c for c in TIMING_CATEGORICAL_COLUMNS if c in x_raw.columns]
+    x = pd.get_dummies(x_raw, columns=cat_cols_presentes, dummy_na=False)
+    x = x.select_dtypes(include=["number", "bool"]).astype(float)
+    return x, y, cat_cols_presentes
 
 # ─── MÁQUINA DE ESTADOS ──────────────────────────────────────────────────────
-async def resolve_pending(value: float):
-    global sig_state, sig_attempt, sig_last_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
-    global sig_signal_id, sig_context_json
-    label = sig_tipo or "Señal HTML"
-    key   = sig_tipo_key or "desconocido"
-    if value >= CONFIRM_TRIGGER:
-        logger.info(f"[v17] ⏭️ Intento 1 confirmó {value:.2f}x — señal descartada | {label}")
-        if sig_signal_id and sig_context_json:
-            update_signal_context_result(sig_signal_id, None, "loss")
-        sig_state = "idle"
-        sig_attempt = 0
-        sig_tipo = None
-        sig_tipo_key = None
-        sig_features = None
-        sig_inmediata = False
-        sig_context_json = None
-        sig_signal_id = None
-        save_state()
-    else:
-        logger.info(f"[v17] 🔎 Intento 1 falló ({value:.2f}x) — señal activa para intento {sig_emit_attempt} | {label}")
-        sig_state = "active"
-        sig_attempt = sig_emit_attempt
-        # La señal, una vez enviada al canal, tiene sólo 2 intentos (el de
-        # emisión + 1 más) — igual que las señales inmediatas. El tope debe
-        # ser relativo al intento de emisión, no un absoluto fijo en 4.
-        sig_last_attempt = sig_emit_attempt + 1
-        text = build_signal_msg(label, value, es_inmediata=False, emit_attempt=sig_emit_attempt)
-        sig_msg_id = await send_signal_msg(text, no_preview=True)
-        save_state()
-
-async def resolve_active(value: float):
-    global sig_state, sig_attempt, sig_last_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
+async def resolve_active(value: float, signal_index: int):
+    global sig_state, sig_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
     global daily_wins, daily_losses, consecutive_wins, consecutive_losses
-    global sig_context_json, sig_signal_id, sig_emit_attempt
+    global sig_context_json, sig_signal_id
+    global session_signal_count, pending_signal_index, is_last_signal_of_session
+    global current_session_results
+
     win = value >= CASHOUT_TRIGGER
-    label = sig_tipo or "Señal HTML"
+    label = sig_tipo or "Señal"
     key = sig_tipo_key or "desconocido"
-    intento = sig_attempt
-    # Intento relativo: cuántas jugadas van desde que la señal se envió al
-    # canal de Telegram (sig_emit_attempt), no el contador absoluto. Si la
-    # señal se emitió en el intento 2 y se gana ahí mismo, es la 1ª jugada
-    # tras el envío -> "WIN 1 EXP.", no "WIN 2.".
-    intento_relativo = max(1, intento - sig_emit_attempt + 1)
-    
+
+    # Reintento de señal de tiempo: si perdió, incrementar fail_count y preparar reintento
+    global timing_retry_pred
+    if key == 'timing_3x_5x':
+        if win:
+            timing_retry_pred = None
+        else:
+            # Buscar la predicción activa y aumentar fail_count
+            for r in recorded_times:
+                if r['alert_shown']:
+                    r['fail_count'] = r.get('fail_count', 0) + 1
+                    logger.info(f"[Timing] 🔼 fail_count aumentado a {r['fail_count']} para la predicción")
+                    break
+            # Reintentar solo si no es la última señal y estamos dentro de la ventana posterior ampliada
+            if not is_last_signal_of_session:
+                ahora = colombia_now()
+                actual = ahora.hour * 3600 + ahora.minute * 60 + ahora.second
+                for r in recorded_times:
+                    diff = r['tiempo_seg'] - actual
+                    post_window = TIMING_ALERT_WINDOW_SEC + r.get('fail_count', 0) * 2
+                    if r['alert_shown'] and diff >= -post_window:
+                        timing_retry_pred = r['tiempo_seg']
+                        logger.info(f"[Timing] 🔁 Pérdida dentro de ventana — reintento habilitado "
+                                    f"(fail_count={r['fail_count']})")
+                        break
+
     if sig_signal_id and sig_context_json:
-        attempt_when_win = intento if win else None
+        attempt_when_win = signal_index if win else None
         result = "win" if win else "loss"
         update_signal_context_result(sig_signal_id, attempt_when_win, result)
-    
+
+    current_session_results.append(win)
+
     if win:
-        logger.info(f"[v17] ✅ GANAMOS intento {intento} — {value:.2f}x | {label}")
-        log_pattern_result(key, label, "win", value, attempt=intento, features_json=sig_features)
-        daily_wins += 1
-        consecutive_wins += 1
-        consecutive_losses = 0
-        await send_signal_msg(build_win_msg(value, label, intento))
-        await send_stats_msg(build_stats_result_msg(value, label, intento_relativo, win=True))
-        sig_state = "idle"
-        sig_attempt = 0
-        sig_msg_id = None
-        sig_tipo = None
-        sig_tipo_key = None
-        sig_features = None
-        sig_inmediata = False
-        sig_context_json = None
-        sig_signal_id = None
-        save_state()
-        await send_stats_update()
-    elif intento < sig_last_attempt:
-        logger.info(f"[v17] ⚠️ Intento {intento} falló ({value:.2f}x) — sigue intento {intento + 1} | {label}")
-        sig_attempt = intento + 1
-        save_state()
+        logger.info(f"[v21] ✅ GANAMOS — {value:.2f}x | {label}")
+        log_pattern_result(key, label, "win", value, attempt=signal_index, features_json=sig_features)
+        await send_signal_msg(build_win_msg(value, signal_index))
+        await send_stats_msg(build_win_status_msg(signal_index))
     else:
-        logger.info(f"[v17] ❌ PERDIMOS intento {intento} — {value:.2f}x | {label}")
-        log_pattern_result(key, label, "loss", value, attempt=intento, features_json=sig_features)
-        daily_losses += 1
-        consecutive_losses += 1
-        if consecutive_losses >= 3:
-            logger.info("[v17] 🔻 3 pérdidas seguidas — racha ganadas reseteada")
-            consecutive_wins = 0
+        logger.info(f"[v21] ❌ PERDIMOS — {value:.2f}x | {label}")
+        log_pattern_result(key, label, "loss", value, attempt=signal_index, features_json=sig_features)
+        await send_signal_msg(build_loss_msg(signal_index, value))
+        await send_stats_msg(build_loss_status_msg(signal_index))
+
+    await update_trend_status_msg(list(history), resolved=True)
+
+    # Limpiar estado de señal ANTES de evaluar la sesión: send_stats_update()
+    # exige sig_state=="idle" para enviar, así que si se limpia después, el
+    # mensaje de estadísticas de sesión nunca sale (bug anterior).
+    sig_state = "idle"
+    sig_attempt = 0
+    sig_msg_id = None
+    sig_tipo = None
+    sig_tipo_key = None
+    sig_features = None
+    sig_inmediata = False
+    sig_context_json = None
+    sig_signal_id = None
+
+    # La sesión termina apenas se gana UNA señal (en cualquier intento del 1 al 5)
+    # — no hace falta llegar a la 5ta —, o cuando se pierden las 5 seguidas sin
+    # ningún acierto.
+    session_ends = win or is_last_signal_of_session
+    if session_ends:
+        session_won = win  # si llegamos acá por is_last_signal_of_session sin ganar, ya perdió las 5
+        if session_won:
+            daily_wins += 1
+            consecutive_wins += 1
             consecutive_losses = 0
-        await send_signal_msg(build_loss_msg(value, label, intento))
-        await send_stats_msg(build_stats_result_msg(value, label, intento_relativo, win=False))
-        sig_state = "idle"
-        sig_attempt = 0
-        sig_msg_id = None
-        sig_tipo = None
-        sig_tipo_key = None
-        sig_features = None
-        sig_inmediata = False
-        sig_context_json = None
-        sig_signal_id = None
+            logger.info(f"[v21] 🏆 Sesión GANADA (acierto en el intento {signal_index}/5)")
+        else:
+            daily_losses += 1
+            consecutive_losses += 1
+            # Cada sesión perdida resetea la racha de victorias consecutivas.
+            consecutive_wins = 0
+            # Enviar mensaje de sesión fallida con el último valor
+            await send_signal_msg(build_session_loss_msg(value))
+            logger.info(f"[v22] ❌ Sesión PERDIDA (5 intentos fallidos, sin aciertos) — racha ganada reseteada")
+
+        # Resetear estado de sesión
+        current_session_results = []
+        pending_signal_index = 0
+        is_last_signal_of_session = False
+        session_signal_count = 0
         save_state()
+        # Mensaje de estadísticas de sesión (resultado del día, % acierto,
+        # racha) — va al chat de señales, igual que el resto de los avisos.
         await send_stats_update()
 
-# ─── PROCESAMIENTO CENTRAL — v17 ─────────────────────────────────────────────
-async def process_new_value(value: float, silent: bool = False):
-    global last_result, history
+    save_state()
+
+# ─── EMISIÓN DE SEÑAL (extraído para reutilizar en el camino directo y en el
+#     camino confirmado por espera) ────────────────────────────────────────
+async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
+                      features_json: str, confirmada_por_espera: bool):
     global sig_state, sig_attempt, sig_last_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
     global sig_emit_attempt, sig_context_json, sig_signal_id
+    global session_signal_count, pending_signal_index, is_last_signal_of_session
+
+    signal_id = f"{tipo_key}_{int(datetime.utcnow().timestamp() * 1000)}"
+    sig_signal_id = signal_id
+    ronda_predicha = None
+
+    try:
+        features_dict = json.loads(features_json)
+        # Se guarda si la señal se emitió directa o recién tras confirmarse
+        # con una ronda <2x — así el modelo de timing puede aprender, con
+        # datos suficientes, cuál de los dos caminos conviene más.
+        features_dict['confirmada_por_espera'] = int(confirmada_por_espera)
+        timing_pred = predict_timing(features_dict)
+        # Aprende en qué ronda (1, 2 o 3) conviene más entrar, según el
+        # historial de attempt_when_win — reemplaza el antiguo bypass fijo.
+        ronda_predicha, _prob_ronda = elegir_ronda_entrada(timing_pred)
+        features_dict['ronda_predicha'] = ronda_predicha
+        emit_attempt = decide_emit_attempt(timing_pred, es_inmediata=False)
+        if emit_attempt == 0:
+            logger.info(f"[v22] 🛑 ML Timing indica no emitir — señal descartada | {tipo_key}")
+            sig_signal_id = None
+            return
+        sig_emit_attempt = 1
+        sig_context_json = json.dumps(features_dict, default=str)
+        log_signal_context(signal_id, tipo_key, value, None, "pending", sig_context_json)
+    except Exception as e:
+        logger.warning(f"[v22] Error en ML timing: {e}")
+        sig_emit_attempt = 1
+        sig_context_json = None
+
+    # Incrementar contador de sesión
+    pending_signal_index = session_signal_count + 1
+    is_last_signal_of_session = (pending_signal_index == 5)
+    if is_last_signal_of_session:
+        session_signal_count = 0
+    else:
+        session_signal_count = pending_signal_index
+
+    # Calcular porcentajes de rangos sobre las últimas 200 rondas
+    pct1, pct2 = calc_pct_rangos(list(history))
+
+    sig_tipo = label
+    sig_tipo_key = tipo_key
+    sig_features = features_json
+    sig_inmediata = True
+    sig_state = "active"
+    sig_attempt = 1
+    sig_last_attempt = MAX_ATTEMPTS_NORMAL
+
+    text = build_signal_msg(label, value, pending_signal_index, pct1, pct2, ronda_predicha=ronda_predicha)
+    sig_msg_id = await send_signal_msg(text, no_preview=True)
+    save_state()
+    origen = "confirmada tras espera <2x" if confirmada_por_espera else "directa"
+    logger.info(f"[v21] ⚡ Señal emitida ({origen}): {tipo_key} — {motivo} (señal {pending_signal_index}/5)")
+
+# ─── PROCESAMIENTO CENTRAL — v21 ─────────────────────────────────────────────
+async def process_new_value(value: float, silent: bool = False):
+    global last_result, history
+    global sig_state, pending_signal_index
+    global pending_confirmation, pending_confirmation_data
+
     history.append(value)
     if len(history) > HISTORY_MAX:
         history = history[-HISTORY_MAX:]
     save_value(value)
+    # Se alimentan siempre, aunque el modo sea silencioso (carga inicial de
+    # historial), para que el predictor de tiempo y las líneas calientes
+    # arranquen con contexto real desde el primer dato disponible.
+    calcular_prediccion_inteligente(value)
     if silent:
         return
+    log_hotline_snapshot(list(history))
     logger.info(f"Nueva cuota: {value:.2f}x | hist:{len(history)} | estado:{sig_state}")
-    vals = list(history)
-    if sig_state == "active":
-        await resolve_active(value)
-    elif sig_state == "pending":
-        await resolve_pending(value)
-    else:
-        resultado = engine.evaluar(vals)
-        if resultado:
-            tipo_key, label, motivo, features_json, es_inmediata = resultado
-            
-            signal_id = f"{tipo_key}_{int(datetime.utcnow().timestamp() * 1000)}"
-            sig_signal_id = signal_id
-            
-            try:
-                features_dict = json.loads(features_json)
-                context_features = extract_context_features(vals, features_dict)
-                timing_pred = predict_timing(context_features)
-                emit_attempt = decide_emit_attempt(timing_pred, es_inmediata)
-                
-                if emit_attempt == 0:
-                    logger.info(f"[v17] 🛑 ML Timing indica no emitir — señal descartada | {tipo_key}")
-                    sig_signal_id = None
-                    return
-                
-                sig_emit_attempt = emit_attempt
-                sig_context_json = json.dumps(context_features, default=str)
-                
-                # Guardar contexto inicial en BD
-                log_signal_context(signal_id, tipo_key, value, None, "pending", sig_context_json)
-            except Exception as e:
-                logger.warning(f"[v17] Error en ML timing: {e}")
-                sig_emit_attempt = 1 if es_inmediata else 2
-                sig_context_json = None
-            
-            sig_tipo = label
-            sig_tipo_key = tipo_key
-            sig_features = features_json
-            sig_inmediata = es_inmediata
-            
-            if es_inmediata:
-                sig_state = "active"
-                sig_attempt = 1
-                sig_last_attempt = MAX_ATTEMPTS_IMMEDIATE
-                text = build_signal_msg(label, value, es_inmediata=True, emit_attempt=1)
-                sig_msg_id = await send_signal_msg(text, no_preview=True)
-                save_state()
-                logger.info(f"[v17] ⚡ Señal INMEDIATA emitida: {tipo_key} — {motivo}")
-            else:
-                sig_state = "pending"
-                sig_attempt = 1
-                sig_last_attempt = MAX_ATTEMPTS_NORMAL
-                save_state()
-                logger.info(f"[v17] 🕓 Señal detectada, esperando confirmación: {tipo_key} — emitirá en intento {sig_emit_attempt} — {motivo}")
 
-# ─── WEBSOCKET ────────────────────────────────────────────────────────────────
-async def ws_loop():
-    global last_result
-    RECONNECT_DELAY = 5
-    def _get_val(item: dict):
-        v = item.get("result") or item.get("multiplier") or item.get("crashPoint")
+    if sig_state == "active":
+        await resolve_active(value, pending_signal_index)
+        return
+
+    # Confirmación previa al envío: si hay una señal pendiente de una ronda
+    # anterior (patrón detectado con la última cuota ≥ CONFIRM_BELOW), se
+    # espera a que esta ronda resulte < CONFIRM_BELOW para recién emitirla.
+    if pending_confirmation:
+        if value < CONFIRM_BELOW:
+            data = pending_confirmation_data
+            pending_confirmation = False
+            pending_confirmation_data = None
+            save_state()
+            if data:
+                await emit_signal(value, data["tipo_key"], data["label"], data["motivo"],
+                                   data["features_json"], confirmada_por_espera=True)
+            return
+        else:
+            # Sigue ≥ CONFIRM_BELOW: se mantiene pendiente, no se evalúan
+            # nuevos patrones mientras se espera la confirmación.
+            logger.info(f"[v21] ⏳ Confirmación pendiente — cuota {value:.2f}x aún ≥ {CONFIRM_BELOW:.2f}x")
+            return
+
+    vals = list(history)
+    await update_trend_status_msg(vals, resolved=False)
+
+    # Señal de tiempo: SOLO si ESTA ronda cayó dentro de la franja de 15-30s
+    # antes del horario predicho del rebote 3x-5x, dispara la entrada.
+    # Si dispara, termina acá.
+    await check_timing_round_trigger()
+    if sig_state == "active":
+        return
+
+    resultado = evaluate_signal(vals)
+    if not resultado:
+        return
+
+    # Solo se consideran señales cuando la tendencia general (200 rondas) es
+    # favorable — mismo criterio que get_stats()/pct_below2/pct_2to5.
+    if not get_stats()["favorable"]:
+        logger.info("[v22] ⏸️ Tendencia NO favorable — señal detectada pero descartada")
+        return
+
+    tipo_key, label, motivo, features_json, es_inmediata = resultado
+
+    if value >= CONFIRM_BELOW:
+        pending_confirmation = True
+        pending_confirmation_data = {
+            "tipo_key": tipo_key, "label": label, "motivo": motivo, "features_json": features_json,
+        }
+        save_state()
+        logger.info(f"[v21] ⏸️ Patrón detectado con cuota {value:.2f}x ≥ {CONFIRM_BELOW:.2f}x — esperando confirmación")
+        return
+
+    await emit_signal(value, tipo_key, label, motivo, features_json, confirmada_por_espera=False)
+
+# ─── CONEXIÓN WEBSOCKET — Pragmatic Play (Spaceman) ──────────────────────────
+# Conexión en tiempo real (igual que spaceman_telegram.py): cada mensaje
+# "gameResult" del WebSocket representa una ronda ya jugada. A diferencia del
+# polling HTTP de Aviator (que debía deduplicar comparando un historial
+# completo devuelto en cada request), acá el problema es otro: el código
+# anterior descartaba una ronda nueva cuando su cuota coincidía con la
+# anterior (`val == last_result`), tratando por error dos rondas distintas
+# con la misma cuota como si fueran la misma ronda repetida. La corrección
+# es identificar cada ronda por su propio identificador (roundId/gameId/id/
+# timestamp que envía Pragmatic Play), NUNCA por el valor de la cuota — así,
+# cuotas repetidas en rondas diferentes se toman siempre como nuevas.
+ws_conn_status = "disconnected"   # disconnected | connecting | connected | error
+ws_conn_detail  = ""
+last_round_signature: Optional[str] = None
+
+_ROUND_ID_KEYS = ('roundId', 'gameId', 'matchId', 'externalGameId', 'gameID', 'id')
+_TIME_ID_KEYS  = ('collectedAt', 'timestamp', 'createdAt', 'time')
+
+def set_ws_status(state: str, detail: str = ""):
+    global ws_conn_status, ws_conn_detail
+    ws_conn_status = state
+    ws_conn_detail = detail
+
+def _get_val(item: dict) -> Optional[float]:
+    v = item.get("result") or item.get("multiplier") or item.get("crashPoint")
+    try:
         return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+def _get_round_signature(item: dict, val: float) -> str:
+    """Firma única por ronda. Prioriza un identificador real de ronda
+    (roundId/gameId/id/...); si no viene ninguno, usa una marca de tiempo:
+    en NINGÚN caso se usa solo el valor de la cuota, que es justamente lo
+    que causaba que rondas distintas con la misma cuota se consideraran
+    duplicadas."""
+    for k in _ROUND_ID_KEYS:
+        if item.get(k) not in (None, ""):
+            return f"id:{item[k]}"
+    for k in _TIME_ID_KEYS:
+        if item.get(k) not in (None, ""):
+            return f"t:{item[k]}|v:{val:.4f}"
+    # Sin id ni timestamp en el payload: se usa el contenido completo del
+    # item (no solo la cuota) para no perder rondas legítimas que repiten
+    # la misma cuota de forma consecutiva.
+    return f"raw:{json.dumps(item, sort_keys=True, default=str)}"
+
+async def ws_loop():
+    global last_round_signature
+    RECONNECT_DELAY = 5
+    set_ws_status("connecting", "🟡 CONECTANDO...")
     while True:
         try:
             logger.info(f"Conectando WebSocket: {WS_URL}")
@@ -1983,6 +1611,7 @@ async def ws_loop():
                     "currency": CURRENCY, "key": [GAME_ID],
                 }))
                 logger.info(f"Suscrito a game {GAME_ID}")
+                set_ws_status("connected", "🟢 CONECTADO — esperando rondas...")
                 async for raw in ws:
                     try:
                         data = json.loads(raw)
@@ -1991,21 +1620,46 @@ async def ws_loop():
                     game_results = data.get("gameResult", [])
                     if not game_results:
                         continue
-                    val = _get_val(game_results[0])
-                    if val is None or val == last_result:
-                        continue
-                    last_result = val
-                    await process_new_value(val, silent=False)
+                    # Se procesan TODAS las rondas del mensaje, en orden, no
+                    # solo la última — así no se pierden rondas si llega más
+                    # de una junta (p. ej. tras una reconexión breve).
+                    for item in game_results:
+                        val = _get_val(item)
+                        if val is None:
+                            continue
+                        sig = _get_round_signature(item, val)
+                        if sig == last_round_signature:
+                            continue
+                        last_round_signature = sig
+                        set_ws_status("connected", f"🟢 CONECTADO — nueva ronda: {val:.2f}x")
+                        await process_new_value(val, silent=False)
+                    try:
+                        await check_timing_predictions()
+                    except Exception as e:
+                        logger.warning(f"Error en check_timing_predictions: {e}")
         except Exception as e:
             logger.error(f"WS error: {e} — reconectando en {RECONNECT_DELAY}s")
+            set_ws_status("error", str(e))
             await asyncio.sleep(RECONNECT_DELAY)
+
+async def timing_predictions_ticker():
+    """Limpieza periódica de predicciones de tiempo vencidas (antes se hacía
+    en cada tick del polling HTTP; con WebSocket las rondas no llegan a
+    intervalo fijo, así que corre en su propio loop independiente)."""
+    while True:
+        await asyncio.sleep(2)
+        try:
+            await check_timing_predictions()
+        except Exception as e:
+            logger.warning(f"Error en check_timing_predictions: {e}")
 
 # ─── FLASK ROUTES ─────────────────────────────────────────────────────────────
 @flask_app.route('/')
 def home():
     stats = get_stats()
     return (
-        f"🤖 SpacemanBot v17 | hist:{len(history)} "
+        f"🤖 SpacemanBot v22 (Pragmatic WS) | hist:{len(history)} "
+        f"| conexión:{ws_conn_status} "
         f"| señal:{sig_state}{'(INM)' if sig_inmediata else ''} "
         f"| tend:{'🟢' if stats['favorable'] else '🔴'}"
     ), 200
@@ -2025,6 +1679,7 @@ def health():
     stats = get_stats()
     return {
         "status": "ok", "history_count": len(history),
+        "connection": {"state": ws_conn_status, "detail": ws_conn_detail},
         "signal": {"state": sig_state, "attempt": sig_attempt, "tipo": sig_tipo, "inmediata": sig_inmediata},
         "favorable": stats["favorable"],
         "pct_below2": round(stats["pct_below2"], 2),
@@ -2035,13 +1690,19 @@ def health():
 def ping():
     return 'pong', 200
 
-# ─── TELEGRAM COMMANDS ─────────────────────────────────────────────────────────
+# ─── STATS UPDATE ────────────────────────────────────────────────────────────
+async def send_stats_update():
+    global stats_msg_id
+    if sig_state != "idle":
+        return
+    if stats_msg_id:
+        await delete_msg(stats_msg_id)
+    stats_msg_id = await send_signal_msg(build_stats_msg())
+    save_state()
+
+# ─── TELEGRAM COMMANDS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['chatid'])
 async def cmd_chatid(message):
-    """Diagnóstico para el error 'chat not found' en temas (topics):
-    responder este comando DENTRO de cada tema (hilo) del grupo para ver el
-    chat_id y message_thread_id reales que hay que poner en las variables de
-    entorno CHAT_ID_BASE, THREAD_SIGNALS y THREAD_STATS."""
     thread = getattr(message, "message_thread_id", None)
     is_topic = getattr(message, "is_topic_message", False)
     await bot.reply_to(message,
@@ -2063,16 +1724,14 @@ async def cmd_start(message):
     await bot.reply_to(message,
         f"🚀 <b>¡Bienvenido {name}!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <b>SPACEMAN BOT v17 — ML TIMING DINÁMICO</b>\n"
-        f"💰 <b>Objetivo único: ≥ {CASHOUT_TARGET:.2f}x</b>\n"
-        "🔁 <b>Confirmación intento 1 (1.60x) + intentos 2, 3 y 4</b>\n"
-        "⚡ <b>Emisión inmediata si tendencia alcista fuerte</b>\n"
-        "🧠 <b>ML de Timing Dinámico: ajusta automáticamente en qué intento (1, 2, 3, 4) se dispara la señal según el contexto en tiempo real + análisis de señales aprendidas</b>\n"
-        "📡 <b>Fuentes de señal</b>\n"
-        "   💎 PATRÓN V1 — Zona de confianza (30-40%)\n"
-        "   💎 PATRÓN V2 — Combo verde agresivo (≥4.0x)\n"
-        "   💎 PATRÓN V3 — Martillo alcista optimizado\n"
-        "🤖 <b>8 agentes como filtro interno</b>\n"
+        "🤖 <b>SPACEMAN BOT v22 — SEÑALES DEL GRÁFICO DE TENDENCIA</b>\n"
+        f"💰 <b>Retiro único: {CASHOUT_TARGET:.2f}x</b>\n"
+        "📈 <b>Señal: cruce EMA4/8/20 del gráfico de tendencia</b>\n"
+        "⏰ <b>Señal de tiempo: rebote 3x-5x (predictor de horario)</b>\n"
+        "🟡🟣 <b>Líneas calientes 5x/10x: feature de ML, no disparan solas</b>\n"
+        "🧠 <b>Gestión Massaniello: hasta 5 señales por sesión (corta al primer acierto)</b>\n"
+        "📈 <b>Estadísticas por sesión (no por señal)</b>\n"
+        "📡 <b>Fuente: Spaceman — Pragmatic Play (WebSocket)</b>\n"
         f"📈 <b>Estado Actual</b>\n"
         f"   Historial: {len(history)} cuotas\n"
         f"   Favorable: {'✅' if stats['favorable'] else '❌'}\n"
@@ -2085,13 +1744,11 @@ async def cmd_stats(message):
     hora    = colombia_time()
     if sig_state == "idle":
         sig_txt = "Idle"
-    elif sig_state == "pending":
-        sig_txt = f"{sig_tipo} (esperando confirmación)"
     else:
-        modo = "INMEDIATA" if sig_inmediata else f"intento {sig_attempt}"
-        sig_txt = f"{sig_tipo} ({modo})"
+        sig_txt = f"{sig_tipo} (activa)"
     total   = daily_wins + daily_losses
     pct     = (daily_wins / total * 100) if total > 0 else 0.0
+    sesion_actual = pending_signal_index if pending_signal_index > 0 else 0
     await bot.reply_to(message,
         f"📊 <b>ESTADÍSTICAS — {hora}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2100,7 +1757,10 @@ async def cmd_stats(message):
         f"🟡 2-5x: {stats['two_to_five']} ({stats['pct_2to5']:.1f}%)\n"
         f"📈 Tendencia: {'🟢 FAVORABLE' if stats['favorable'] else '🔴 DESFAVORABLE'}\n"
         f"📡 Señal: <code>{sig_txt}</code>\n"
-        f"✅ Wins: {daily_wins} | ❌ Losses: {daily_losses} | 💎 {pct:.1f}%\n"
+        f"✅ Sesiones Ganadas: {daily_wins} | ❌ Sesiones Perdidas: {daily_losses}\n"
+        f"💎 Acierto de Sesiones: {pct:.1f}%\n"
+        f"📈 Racha de Sesiones Ganadas: {consecutive_wins}\n"
+        f"🧠 Sesión actual: {sesion_actual}/5\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
@@ -2126,13 +1786,10 @@ async def self_ping_loop():
 async def daily_reset_loop():
     global daily_wins, daily_losses, consecutive_wins, consecutive_losses
     while True:
-        now           = colombia_now()
+        now = colombia_now()
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         await asyncio.sleep((next_midnight - now).total_seconds())
-        meses   = ["Enero","Febrero","Marzo","Abril","Mayo","Junio",
-                   "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
-        dia_str = f"{now.day} de {meses[now.month - 1]} {now.year}"
-        await send_stats_msg(f"🤑 <b>Resultados del {dia_str}</b>\n" + build_stats_msg())
+        await send_stats_msg("🤑 <b>Resultados del día</b>\n" + build_stats_msg())
         daily_wins = daily_losses = consecutive_wins = consecutive_losses = 0
         save_state()
         logger.info("🔄 Estadísticas reiniciadas — 00:00 Colombia")
@@ -2140,8 +1797,11 @@ async def daily_reset_loop():
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main_async():
     global _main_loop
+    global current_session_results
+    current_session_results = []
+
     _main_loop = asyncio.get_running_loop()
-    logger.info("🤖 Iniciando SPACEMAN Bot v17 — ML Timing Dinámico...")
+    logger.info("🤖 Iniciando SPACEMAN Bot v22 — WebSocket Pragmatic Play + estrategias de tendencia/líneas calientes/timing")
     db_init()
     load_state()
     load_ml_model()
@@ -2156,18 +1816,12 @@ async def main_async():
         types.BotCommand('patrones', '📈 Efectividad por patrón (24h)'),
         types.BotCommand('chatid', '🆔 Ver chat_id / thread_id de este tema'),
     ])
-    if CHAT_ID_BASE > 0:
-        logger.warning(
-            f"[v17] ⚠️ CHAT_ID_BASE={CHAT_ID_BASE} es positivo. Los grupos/"
-            "supergrupos con temas (topics) usan chat_id NEGATIVO, típicamente "
-            "con prefijo -100 (ej: -1003965615775). Si los envíos fallan con "
-            "'chat not found', usá /chatid dentro del grupo para obtener el "
-            "valor correcto y actualizar la variable de entorno."
-        )
     asyncio.create_task(ws_loop())
+    asyncio.create_task(timing_predictions_ticker())
     asyncio.create_task(self_ping_loop())
     asyncio.create_task(daily_reset_loop())
-    asyncio.create_task(auto_train_loop())
+    if AUTO_TRAIN_ENABLED and ML_LIBS_OK:
+        asyncio.create_task(auto_train_loop())
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
     if render_url:
         await bot.remove_webhook()
@@ -2184,179 +1838,6 @@ def run_flask():
     port = int(os.environ.get('PORT', 8080))
     flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MODO ENTRENAMIENTO
-# ═══════════════════════════════════════════════════════════════════════════
-def cargar_datos_entrenamiento(db_path: str):
-    if not os.path.exists(db_path):
-        sys.exit(f"No se encontró la base: {db_path}")
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        "SELECT tipo_key, result, features_json FROM pattern_stats "
-        "WHERE features_json IS NOT NULL AND result IN ('win','loss')"
-    ).fetchall()
-    con.close()
-    registros = []
-    descartados = 0
-    for row in rows:
-        try:
-            features = json.loads(row["features_json"])
-        except (TypeError, ValueError):
-            descartados += 1
-            continue
-        flat = flatten_features(row["tipo_key"], features)
-        flat["_target"] = 1 if row["result"] == "win" else 0
-        registros.append(flat)
-    if descartados:
-        print(f"⚠️  {descartados} fila(s) con features inválido, ignoradas.")
-    return pd.DataFrame(registros)
-
-def construir_matriz_entrenamiento(df):
-    y = df["_target"].astype(int)
-    x_raw = df.drop(columns=["_target"])
-    cat_cols_presentes = [c for c in CATEGORICAL_COLUMNS if c in x_raw.columns]
-    x = pd.get_dummies(x_raw, columns=cat_cols_presentes, dummy_na=False)
-    x = x.select_dtypes(include=["number", "bool"]).astype(float)
-    return x, y, cat_cols_presentes
-
-TIMING_CATEGORICAL_COLUMNS = ['tipo_key']
-
-def cargar_datos_timing(db_path: str):
-    if not os.path.exists(db_path):
-        sys.exit(f"No se encontró la base: {db_path}")
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        "SELECT signal_id, tipo_key, trigger_value, attempt_when_win, result, context_json "
-        "FROM signal_contexts WHERE context_json IS NOT NULL AND result IN ('win','loss')"
-    ).fetchall()
-    con.close()
-    registros = []
-    descartados = 0
-    for row in rows:
-        try:
-            context = json.loads(row["context_json"])
-        except (TypeError, ValueError):
-            descartados += 1
-            continue
-        flat = dict(context)
-        if row["result"] == "loss":
-            flat["_target"] = 0
-        else:
-            attempt = row["attempt_when_win"]
-            if attempt in (1, 2, 3, 4):
-                flat["_target"] = attempt
-            else:
-                flat["_target"] = 0
-        registros.append(flat)
-    if descartados:
-        print(f"⚠️  {descartados} fila(s) con context inválido, ignoradas.")
-    return pd.DataFrame(registros)
-
-def construir_matriz_timing(df):
-    y = df["_target"].astype(int)
-    x_raw = df.drop(columns=["_target"])
-    cat_cols_presentes = [c for c in TIMING_CATEGORICAL_COLUMNS if c in x_raw.columns]
-    x = pd.get_dummies(x_raw, columns=cat_cols_presentes, dummy_na=False)
-    x = x.select_dtypes(include=["number", "bool"]).astype(float)
-    return x, y, cat_cols_presentes
-
-def run_train_cli(argv: List[str]):
-    if not ML_LIBS_OK:
-        sys.exit("Faltan librerías ML. Instalá: pip install pandas scikit-learn joblib")
-    try:
-        from sklearn.ensemble import HistGradientBoostingClassifier
-        from sklearn.model_selection import train_test_split
-        from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
-    except ImportError:
-        sys.exit("Falta scikit-learn")
-    import argparse
-    ap = argparse.ArgumentParser(prog="main.py train")
-    ap.add_argument("--db", default=DB_FILE)
-    ap.add_argument("--output", default=MODEL_FILE)
-    ap.add_argument("--timing", action="store_true", help="Entrenar modelo de timing")
-    ap.add_argument("--timing-output", default=TIMING_MODEL_FILE)
-    ap.add_argument("--min-rows", type=int, default=100)
-    ap.add_argument("--test-size", type=float, default=0.2)
-    args = ap.parse_args(argv)
-    
-    if args.timing:
-        print(f"📥 Leyendo signal_contexts desde '{args.db}'...")
-        df = cargar_datos_timing(args.db)
-        if len(df) < args.min_rows:
-            sys.exit(f"❌ Solo {len(df)} contextos (mínimo {args.min_rows}).")
-        print(f"   {len(df)} contextos resueltos.")
-        print(df["_target"].value_counts().rename({0: "loss", 1: "win_1", 2: "win_2", 3: "win_3", 4: "win_4"}).to_string())
-        print()
-        x, y, cat_cols_presentes = construir_matriz_timing(df)
-        x_train, x_test, y_train, y_test = train_test_split(
-            x, y, test_size=args.test_size, random_state=42,
-            stratify=y if y.nunique() > 1 else None
-        )
-        print("🧠 Entrenando HistGradientBoostingClassifier (timing)...")
-        model = HistGradientBoostingClassifier(
-            max_depth=4, learning_rate=0.08, max_iter=200,
-            l2_regularization=1.0, random_state=42,
-        )
-        model.fit(x_train, y_train)
-        y_pred = model.predict(x_test)
-        print()
-        print("📊 Resultados validación:")
-        print(f"   Accuracy: {accuracy_score(y_test, y_pred):.3f}")
-        print(classification_report(y_test, y_pred, 
-                                    target_names=["loss", "win_1", "win_2", "win_3", "win_4"],
-                                    zero_division=0))
-        artifact = {
-            "model": model,
-            "feature_columns": list(x.columns),
-            "categorical_columns": cat_cols_presentes,
-        }
-        joblib.dump(artifact, args.timing_output)
-        print(f"✅ Modelo timing guardado en '{args.timing_output}' ({len(x.columns)} features).")
-    else:
-        print(f"📥 Leyendo pattern_stats desde '{args.db}'...")
-        df = cargar_datos_entrenamiento(args.db)
-        if len(df) < args.min_rows:
-            sys.exit(f"❌ Solo {len(df)} señales (mínimo {args.min_rows}).")
-        print(f"   {len(df)} señales resueltas.")
-        print(df["_target"].value_counts().rename({1: "win", 0: "loss"}).to_string())
-        print()
-        print("Distribución por patrón:")
-        print(df.groupby("tipo_key")["_target"].agg(["count", "mean"]).rename(
-            columns={"count": "n", "mean": "win_rate"}
-        ).to_string())
-        print()
-        x, y, cat_cols_presentes = construir_matriz_entrenamiento(df)
-        x_train, x_test, y_train, y_test = train_test_split(
-            x, y, test_size=args.test_size, random_state=42,
-            stratify=y if y.nunique() > 1 else None
-        )
-        print("🧠 Entrenando HistGradientBoostingClassifier...")
-        model = HistGradientBoostingClassifier(
-            max_depth=4, learning_rate=0.08, max_iter=200,
-            l2_regularization=1.0, random_state=42,
-        )
-        model.fit(x_train, y_train)
-        y_pred = model.predict(x_test)
-        y_proba = model.predict_proba(x_test)[:, 1]
-        print()
-        print("📊 Resultados validación:")
-        print(f"   Accuracy: {accuracy_score(y_test, y_pred):.3f}")
-        if y_test.nunique() > 1:
-            print(f"   ROC AUC:  {roc_auc_score(y_test, y_proba):.3f}")
-        print(classification_report(y_test, y_pred, target_names=["loss", "win"], zero_division=0))
-        artifact = {
-            "model": model,
-            "feature_columns": list(x.columns),
-            "categorical_columns": cat_cols_presentes,
-        }
-        joblib.dump(artifact, args.output)
-        print(f"✅ Modelo guardado en '{args.output}' ({len(x.columns)} features).")
-
 if __name__ == '__main__':
-    if len(sys.argv) > 1 and sys.argv[1] == 'train':
-        run_train_cli(sys.argv[2:])
-    else:
-        threading.Thread(target=run_flask, daemon=True).start()
-        asyncio.run(main_async())
+    threading.Thread(target=run_flask, daemon=True).start()
+    asyncio.run(main_async())
