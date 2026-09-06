@@ -102,6 +102,26 @@ TIMING_PREALERT_MAX_SEC = int(os.environ.get("TIMING_PREALERT_MAX_SEC", "30"))
 TIMING_ALERT_WINDOW_SEC = int(os.environ.get("TIMING_ALERT_WINDOW_SEC", "10"))
 TIMING_DEDUPE_SEC       = int(os.environ.get("TIMING_DEDUPE_SEC", "15"))
 
+# Precisión mínima exigida por NIVEL de señal (C1/C2/C3). Cada nivel exige una
+# probabilidad de éxito más alta que el anterior: si hay más de una predicción
+# de horario vigente en la ventana al momento de disparar, se elige "la que
+# mejor" (mayor probabilidad estimada por el modelo de timing) para ESE nivel,
+# en vez de la primera que caiga en ventana. Así C2 exige más precisión que
+# C1, y C3 más que C2, para no arriesgar la sesión en los niveles avanzados.
+TIMING_MIN_PROB_C1 = float(os.environ.get("TIMING_MIN_PROB_C1", "0.35"))
+TIMING_MIN_PROB_C2 = float(os.environ.get("TIMING_MIN_PROB_C2", "0.45"))
+TIMING_MIN_PROB_C3 = float(os.environ.get("TIMING_MIN_PROB_C3", "0.55"))
+TIMING_MIN_PROB_BY_NIVEL = {1: TIMING_MIN_PROB_C1, 2: TIMING_MIN_PROB_C2, 3: TIMING_MIN_PROB_C3}
+
+def timing_min_prob_nivel(nivel: int) -> float:
+    return TIMING_MIN_PROB_BY_NIVEL.get(nivel, TIMING_MIN_PROB)
+
+def intento_global_actual(nivel: int, intento_local: int, intentos_por_nivel: int) -> int:
+    """Numera los intentos de forma continua a lo largo de toda la sesión:
+    con 2 intentos por nivel, C1 = intentos 1-2, C2 = intentos 3-4,
+    C3 = intentos 5-6."""
+    return (nivel - 1) * intentos_por_nivel + intento_local
+
 AUTO_TRAIN_ENABLED     = os.environ.get("AUTO_TRAIN_ENABLED", "1") == "1"
 AUTO_TRAIN_MIN_ROWS    = int(os.environ.get("AUTO_TRAIN_MIN_ROWS", "100"))
 AUTO_TRAIN_MIN_NEW     = int(os.environ.get("AUTO_TRAIN_MIN_NEW", "30"))
@@ -144,7 +164,7 @@ def get_session_max_signals() -> int:
 def get_max_attempts() -> int:
     return MAX_ATTEMPTS_LIVE if is_trained else MAX_ATTEMPTS_TRAIN
 
-def nivel_columna_label(n: int) -> str:
+def nivel_senal_label(n: int) -> str:
     return f"C{n}"
 GAME_LINK = "https://1win.lat/casino/play/v_pragmatic:spaceman"
 
@@ -373,14 +393,57 @@ async def check_timing_predictions():
         vigentes.append(r)
     recorded_times = vigentes
 
+def build_timing_features(nivel_actual: int, intento_global: int) -> dict:
+    """Features de la señal de tiempo (ventana 3x-5x), incluyendo el nivel de
+    señal (C1/C2/C3) y el intento global (1-6: C1=1-2, C2=3-4, C3=5-6) como
+    features numéricas, para que el modelo de ML aprenda a ajustar el horario
+    de entrada de forma independiente por cada nivel/intento."""
+    ultimo_valor = history[-1] if history else 0.0
+    return {
+        'tipo_key': 'timing_3x_5x',
+        'ultimo_valor': ultimo_valor,
+        'confidence': 60,
+        'tendencia_lucky': 'AMARILLO',
+        'agresiva_condicion': False,
+        'ema4': None, 'ema8': None, 'ema20': None, 'ema50': None,
+        'votos': {}, 'contar_entrar': 0, 'contar_no_entrar': 0, 'risk_score': 0,
+        'rsi': None, 'macd': None, 'fuerza': None, 'ia_prob': None,
+        'racha_rango_activa': False, 'rango_activo': "3.00x-5.00x",
+        'nivel_actual': nivel_actual,
+        'intento_global': intento_global,
+    }
+
+def score_timing_candidate(nivel_actual: int, intento_global: int, diff: float) -> float:
+    """Puntúa una predicción de horario candidata para el nivel/intento dado.
+    Con modelo de timing entrenado: probabilidad de éxito estimada (suma de
+    win_1..win_4). Sin modelo todavía: se prioriza la predicción más cercana
+    al horario exacto (diff más chico), como aproximación razonable de
+    'la que mejor' mientras se recolectan datos."""
+    if timing_model is not None:
+        pred = predict_timing(build_timing_features(nivel_actual, intento_global))
+        if pred:
+            return sum(v for k, v in pred.items() if k.startswith('win_'))
+    return -abs(diff)
+
 async def check_timing_round_trigger():
-    """Dispara la señal de tiempo con ventanas dinámicas según fallos acumulados.
-    Cada fallo reduce el preaviso mínimo/máximo y amplía la ventana posterior."""
+    """Dispara la señal de tiempo eligiendo, entre TODAS las predicciones que
+    caen en ventana en este momento, "la que mejor" le queda al nivel actual
+    (C1/C2/C3) — mayor precisión estimada por el modelo de timing, en vez de
+    disparar con la primera que coincida. Cada nivel exige una probabilidad
+    mínima creciente (TIMING_MIN_PROB_C1 < C2 < C3): C1 usa los intentos
+    globales 1-2, C2 los intentos 3-4 y C3 los intentos 5-6, y a medida que se
+    sube de nivel la entrada debe ser más precisa para no perder la sesión.
+    Cada fallo además reduce el preaviso mínimo/máximo y amplía la ventana
+    posterior del candidato afectado."""
     global recorded_times, timing_retry_pred
     if sig_state != "idle" or pending_confirmation:
         return
+    nivel_actual = session_signal_count + 1
+    intentos_por_nivel = get_max_attempts()
+    intento_global = intento_global_actual(nivel_actual, 1, intentos_por_nivel)
     ahora = colombia_now()
     actual = ahora.hour * 3600 + ahora.minute * 60 + ahora.second
+    candidatos = []
     for r in recorded_times:
         diff = r['tiempo_seg'] - actual
         fail_count = r.get('fail_count', 0)
@@ -397,34 +460,45 @@ async def check_timing_round_trigger():
         reintento = (r['alert_shown'] and timing_retry_pred == r['tiempo_seg']
                      and diff >= -post_window)
         if primera_vez or reintento:
-            r['alert_shown'] = True
-            timing_retry_pred = None
-            if reintento:
-                logger.info(f"[Timing] 🔁 Reintento de señal de tiempo (fail_count={fail_count}, diff={diff:.0f}s)")
-            else:
-                logger.info(f"[Timing] ⏰ Enviando señal {diff:.0f}s antes del rebote (fail_count={fail_count})")
-            await emit_timing_signal()
-            break
+            candidatos.append((r, diff, primera_vez))
 
-async def emit_timing_signal():
+    if not candidatos:
+        return
+
+    mejor_r, mejor_diff, era_primera = max(
+        candidatos, key=lambda c: score_timing_candidate(nivel_actual, intento_global, c[1])
+    )
+    umbral = timing_min_prob_nivel(nivel_actual)
+    mejor_score = score_timing_candidate(nivel_actual, intento_global, mejor_diff)
+    if is_trained and timing_model is not None and mejor_score < umbral:
+        logger.info(f"[Timing] ⚠️ Mejor candidato para {nivel_senal_label(nivel_actual)} "
+                    f"no alcanza precisión mínima ({mejor_score:.2f} < {umbral:.2f}) — se espera otra ronda")
+        return
+
+    mejor_r['alert_shown'] = True
+    timing_retry_pred = None
+    if not era_primera:
+        logger.info(f"[Timing] 🔁 Reintento de señal de tiempo — {nivel_senal_label(nivel_actual)} "
+                    f"(fail_count={mejor_r.get('fail_count', 0)}, diff={mejor_diff:.0f}s)")
+    else:
+        logger.info(f"[Timing] ⏰ Enviando señal {nivel_senal_label(nivel_actual)} "
+                    f"(intento global {intento_global}/{get_session_max_signals() * intentos_por_nivel}) "
+                    f"{mejor_diff:.0f}s antes del rebote, score={mejor_score:.2f} "
+                    f"(fail_count={mejor_r.get('fail_count', 0)})")
+    await emit_timing_signal(nivel_actual, intento_global)
+
+async def emit_timing_signal(nivel_actual: int, intento_global: int):
     """Emite la señal de tiempo (ventana 3x-5x) reutilizando el mismo pipeline
     de sesión/ML que la señal de tendencia — el objetivo de retiro sigue
-    siendo 2x. Ya no se bloquea por tendencia general."""
-    ultimo_valor = history[-1] if history else 0.0
-    features = {
-        'tipo_key': 'timing_3x_5x',
-        'ultimo_valor': ultimo_valor,
-        'confidence': 60,
-        'tendencia_lucky': 'AMARILLO',
-        'agresiva_condicion': False,
-        'ema4': None, 'ema8': None, 'ema20': None, 'ema50': None,
-        'votos': {}, 'contar_entrar': 0, 'contar_no_entrar': 0, 'risk_score': 0,
-        'rsi': None, 'macd': None, 'fuerza': None, 'ia_prob': None,
-        'racha_rango_activa': False, 'rango_activo': "3.00x-5.00x",
-    }
+    siendo 2x. Ya no se bloquea por tendencia general. Incluye nivel_actual e
+    intento_global como features para que el modelo de ML de timing aprenda a
+    ajustar el horario de entrada de forma independiente para C1, C2 y C3."""
+    features = build_timing_features(nivel_actual, intento_global)
+    ultimo_valor = features['ultimo_valor']
     features_json = json.dumps(features, default=str)
     label = "SEÑAL DE TIEMPO 3x-5x ⏰"
-    motivo = "Horario predicho de rebote 3x-5x alcanzado — objetivo de retiro 2.00x"
+    motivo = (f"Horario predicho de rebote 3x-5x alcanzado — {nivel_senal_label(nivel_actual)}, "
+              f"intento global {intento_global}, objetivo de retiro 2.00x")
     await emit_signal(ultimo_valor, 'timing_3x_5x', label, motivo, features_json,
                        confirmada_por_espera=False)
 
@@ -499,14 +573,14 @@ def calc_pct_rangos_full(vals: List[float]) -> tuple:
 def build_signal_msg(tipo_label: str, last_value: float, sesion_index: int,
                      pct_rango1: float, pct_rango2: float,
                      ronda_predicha: Optional[int] = None) -> str:
-    # Formato fijo de señal — nivel de columna (C1/C2/C3) en vez de contador
+    # Formato fijo de señal — nivel de señal (C1/C2/C3) en vez de contador
     # de sesión; sin línea de ronda predicha por el ML de timing.
-    nivel = nivel_columna_label(sesion_index)
+    nivel = nivel_senal_label(sesion_index)
     return (
         f"<b>✅✅ ENTRADA CONFIRMADA ✅✅</b>\n\n"
         f"👉 INGRESAR DESPUÉS: {last_value:.2f}x\n"
         f"💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x\n\n"
-        f"🧠 NIVEL DE COLUMNA: {nivel}\n"
+        f"🧠 NIVEL DE SEÑAL: {nivel}\n"
         f"📈 TENDENCIA 200 RONDAS\n"
         f"🔵 1.00x-1.99x = {pct_rango1:.2f}%\n"
         f"🟢 2.00x-4.99x = {pct_rango2:.2f}%\n\n"
@@ -527,12 +601,27 @@ def build_loss_msg(intento: int, result: float, de: Optional[int] = None) -> str
         f"💥 Mantener la calma intento {intento} de {total}"
     )
 
-def build_retry_attempt_msg(intento: int, total: int, result: float) -> str:
-    """Aviso de que el nivel sigue activo: falló un intento pero quedan más
-    intentos seguidos dentro del mismo nivel (C1/C2/C3) antes de resolverlo."""
+def build_retry_attempt_msg(nivel_label: str) -> str:
+    """Aviso de que el nivel sigue activo: falló el primer intento pero
+    queda un segundo intento dentro del mismo nivel (misma entrada, mismo
+    retiro). Se guarda su msg_id (sig_retry_msg_id) para borrarlo apenas se
+    resuelva el nivel (win o loss del 2do intento)."""
     return (
-        f"🧠 <b>INTENTO {intento} FALLIDO — Resultado: {result:.2f}x</b>\n"
-        f"🔁 Va el intento {intento + 1} de {total} — misma entrada"
+        f"🔁 <b>REPETIR ENTRADA {CASHOUT_TARGET:.2f}x</b>\n"
+        f"🎯 <b>NIVEL DE SEÑAL {nivel_label}</b>"
+    )
+
+def build_level_loss_msg(nivel_label: str, siguiente_label: str, resultados: List[float],
+                         intento_actual: int, intento_total: int) -> str:
+    """Se envía cuando se agotan los intentos de un nivel (C1/C2/C3) sin
+    acertar. Borra el mensaje de 'REPETIR ENTRADA' y muestra las cuotas de
+    todos los intentos de ese nivel, más el contador acumulado de intentos
+    de la sesión (p.ej. 2 de 6: 3 niveles × 2 intentos)."""
+    resultados_str = " - ".join(f"{v:.2f}x" for v in resultados)
+    return (
+        f"🧠 <b>{nivel_label} PERDIDO, ESPERAR SEÑAL {siguiente_label}!!!</b>\n"
+        f"❌ <b>Resultados Señal {nivel_label}: {resultados_str}</b>\n"
+        f"💥 Mantener la calma intento {intento_actual} de {intento_total}"
     )
 
 def build_win_status_msg(intento: int) -> str:
@@ -663,6 +752,8 @@ def save_state():
         "pending_confirmation_data": json.dumps(pending_confirmation_data) if pending_confirmation_data else "",
         "is_trained": "1" if is_trained else "0",
         "sig_favorable": "1" if sig_favorable else "0",
+        "sig_retry_msg_id": str(sig_retry_msg_id) if sig_retry_msg_id is not None else "",
+        "sig_attempt_values": json.dumps(sig_attempt_values),
     }
     _save_dict(values)
 
@@ -675,6 +766,7 @@ def load_state():
     global pending_confirmation, pending_confirmation_data
     global is_trained
     global sig_favorable
+    global sig_retry_msg_id, sig_attempt_values
 
     d = _load_dict()
     sig_state         = d.get("sig_state", "idle") or "idle"
@@ -712,6 +804,13 @@ def load_state():
         pending_confirmation_data = None
     is_trained = (d.get("is_trained", "0") or "0") == "1"
     sig_favorable = (d.get("sig_favorable", "1") or "1") == "1"
+    _rmid = d.get("sig_retry_msg_id", "")
+    sig_retry_msg_id = int(_rmid) if _rmid else None
+    _sav = d.get("sig_attempt_values", "")
+    try:
+        sig_attempt_values = json.loads(_sav) if _sav else []
+    except (TypeError, ValueError):
+        sig_attempt_values = []
     logger.info(
         f"[v21] Estado cargado | estado={sig_state} sesion={session_signal_count} "
         f"esperando_confirmacion={pending_confirmation}"
@@ -882,6 +981,8 @@ is_trained: bool = False  # False = fase de entrenamiento silenciosa; True = en 
 # procesa igual en 2 planos (log_pattern_result + signal_contexts) para
 # entrenar los modelos, pero no se manda ningún mensaje al chat.
 sig_favorable: bool = True
+sig_retry_msg_id: Optional[int] = None  # id del mensaje "REPETIR ENTRADA" del intento 1, para poder borrarlo al resolver el nivel
+sig_attempt_values: List[float] = []  # cuotas de cada intento del nivel activo (C1/C2/C3), para "Resultados Señal Cx: ..."
 
 # ─── CONFIRMACIÓN PREVIA AL ENVÍO (nuevo) ────────────────────────────────────
 # Si el patrón se detecta pero la última cuota registrada ya fue ≥2x, la señal
@@ -1404,11 +1505,13 @@ async def resolve_active(value: float, signal_index: int):
     global current_session_results
     global is_trained
     global sig_favorable
+    global sig_retry_msg_id, sig_attempt_values
 
     win = value >= CASHOUT_TRIGGER
     # sig_favorable quedó fijado en emit_signal() para ESTA señal activa —
     # se usa para decidir si sus mensajes de resultado van a Telegram.
     favorable_actual = sig_favorable
+    sig_attempt_values.append(value)
 
     # Si perdió pero todavía quedan intentos dentro de ESTE nivel (en vivo:
     # 2 intentos seguidos por nivel C1/C2/C3), no se resuelve todavía: se
@@ -1417,7 +1520,8 @@ async def resolve_active(value: float, signal_index: int):
         sig_attempt += 1
         logger.info(f"[v21] 🔁 Intento {sig_attempt-1}/{sig_last_attempt} fallido — va el intento {sig_attempt} (misma entrada)")
         if is_trained and favorable_actual:
-            await send_signal_msg(build_retry_attempt_msg(sig_attempt - 1, sig_last_attempt, value))
+            nivel_label = nivel_senal_label(pending_signal_index)
+            sig_retry_msg_id = await send_signal_msg(build_retry_attempt_msg(nivel_label))
         save_state()
         return
 
@@ -1460,13 +1564,25 @@ async def resolve_active(value: float, signal_index: int):
         logger.info(f"[v21] ✅ GANAMOS — {value:.2f}x | {label}")
         log_pattern_result(key, label, "win", value, attempt=signal_index, features_json=sig_features)
         if is_trained and favorable_actual:
+            if sig_retry_msg_id:
+                await delete_msg(sig_retry_msg_id)
+                sig_retry_msg_id = None
             await send_signal_msg(build_win_msg(value, sig_attempt))
             await send_stats_msg(build_win_status_msg(sig_attempt))
     else:
         logger.info(f"[v21] ❌ PERDIMOS — {value:.2f}x | {label}")
         log_pattern_result(key, label, "loss", value, attempt=signal_index, features_json=sig_features)
         if is_trained and favorable_actual:
-            await send_signal_msg(build_loss_msg(sig_attempt, value, de=sig_last_attempt))
+            if sig_retry_msg_id:
+                await delete_msg(sig_retry_msg_id)
+                sig_retry_msg_id = None
+            nivel_label = nivel_senal_label(pending_signal_index)
+            siguiente_index = pending_signal_index + 1 if not is_last_signal_of_session else 1
+            siguiente_label = nivel_senal_label(siguiente_index)
+            intento_actual = intento_global_actual(pending_signal_index, sig_attempt, sig_last_attempt)
+            intento_total = get_session_max_signals() * get_max_attempts()
+            await send_signal_msg(build_level_loss_msg(
+                nivel_label, siguiente_label, sig_attempt_values, intento_actual, intento_total))
             await send_stats_msg(build_loss_status_msg(sig_attempt))
 
     if is_trained and favorable_actual:
@@ -1485,6 +1601,8 @@ async def resolve_active(value: float, signal_index: int):
     sig_context_json = None
     sig_signal_id = None
     sig_favorable = True
+    sig_retry_msg_id = None
+    sig_attempt_values = []
 
     # La sesión termina apenas se gana UN nivel (C1, C2 o C3), o cuando se
     # pierden todos los niveles de la sesión sin ningún acierto.
@@ -1492,19 +1610,27 @@ async def resolve_active(value: float, signal_index: int):
     if session_ends:
         session_won = win  # si llegamos acá por is_last_signal_of_session sin ganar, ya perdió todos los niveles
         max_niveles = get_session_max_signals()
+        # Solo se contabilizan en las estadísticas del día las sesiones cuya
+        # señal SÍ se envió a Telegram (en vivo + tendencia favorable). Las
+        # sesiones silenciosas (entrenamiento o tendencia desfavorable) se
+        # siguen registrando para el modelo, pero no suman ni restan acá.
+        contabiliza = is_trained and favorable_actual
         if session_won:
-            daily_wins += 1
-            consecutive_wins += 1
-            consecutive_losses = 0
-            logger.info(f"[v21] 🏆 Sesión GANADA (acierto en el nivel {pending_signal_index}/{max_niveles})")
+            if contabiliza:
+                daily_wins += 1
+                consecutive_wins += 1
+                consecutive_losses = 0
+            logger.info(f"[v21] 🏆 Sesión GANADA (acierto en el nivel {pending_signal_index}/{max_niveles})"
+                        + ("" if contabiliza else " — no contabilizada (no se envió a Telegram)"))
         else:
-            daily_losses += 1
-            consecutive_losses += 1
-            # Cada sesión perdida resetea la racha de victorias consecutivas.
-            consecutive_wins = 0
-            if is_trained and favorable_actual:
+            if contabiliza:
+                daily_losses += 1
+                consecutive_losses += 1
+                # Cada sesión perdida resetea la racha de victorias consecutivas.
+                consecutive_wins = 0
                 await send_signal_msg(build_session_loss_msg(value))
-            logger.info(f"[v22] ❌ Sesión PERDIDA ({max_niveles} niveles fallidos, sin aciertos) — racha ganada reseteada")
+            logger.info(f"[v22] ❌ Sesión PERDIDA ({max_niveles} niveles fallidos, sin aciertos) — racha ganada reseteada"
+                        + ("" if contabiliza else " — no contabilizada (no se envió a Telegram)"))
 
         # Resetear estado de sesión
         current_session_results = []
@@ -1514,7 +1640,7 @@ async def resolve_active(value: float, signal_index: int):
         save_state()
         # Mensaje de estadísticas de sesión (resultado del día, % acierto,
         # racha) — va al chat de señales, igual que el resto de los avisos.
-        if is_trained and favorable_actual:
+        if contabiliza:
             await send_stats_update()
         # Chequeo de fin de fase de entrenamiento: se hace entre sesiones,
         # nunca a mitad de una, para no cambiar niveles/intentos con una
@@ -1532,10 +1658,13 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     global sig_emit_attempt, sig_context_json, sig_signal_id
     global session_signal_count, pending_signal_index, is_last_signal_of_session
     global sig_favorable
+    global sig_retry_msg_id, sig_attempt_values
 
     signal_id = f"{tipo_key}_{int(datetime.utcnow().timestamp() * 1000)}"
     sig_signal_id = signal_id
     ronda_predicha = None
+    sig_retry_msg_id = None
+    sig_attempt_values = []
 
     try:
         features_dict = json.loads(features_json)
