@@ -122,7 +122,30 @@ HISTORY_MAX   = 200
 # con value >= CASHOUT_TRIGGER (2x) — nunca con la cuota "propia" del patrón.
 CASHOUT_TARGET  = 2.00
 CASHOUT_TRIGGER = 2.00
-MAX_ATTEMPTS_NORMAL = 1   # solo un intento por señal
+
+# ─── FASE DE ENTRENAMIENTO / EN VIVO ──────────────────────────────────────
+# Las primeras TRAINING_SIGNALS_REQUIRED señales de tiempo se usan SOLO para
+# entrenar el modelo (nunca se envían a Telegram, solo se registran en la DB).
+# En esa fase la sesión usa hasta SESSION_MAX_SIGNALS_TRAIN señales de 1
+# intento cada una. Al llegar a ese número se entrena el modelo y se pasa a
+# modo EN VIVO: sesión de SESSION_MAX_SIGNALS_LIVE niveles (C1/C2/C3),
+# MAX_ATTEMPTS_LIVE intentos seguidos por nivel — la sesión se pierde si se
+# pierden todos los niveles.
+TRAINING_SIGNALS_REQUIRED = int(os.environ.get("TRAINING_SIGNALS_REQUIRED", "120"))
+SESSION_MAX_SIGNALS_TRAIN = int(os.environ.get("SESSION_MAX_SIGNALS_TRAIN", "6"))
+SESSION_MAX_SIGNALS_LIVE  = int(os.environ.get("SESSION_MAX_SIGNALS_LIVE",  "3"))
+MAX_ATTEMPTS_TRAIN        = int(os.environ.get("MAX_ATTEMPTS_TRAIN", "1"))
+MAX_ATTEMPTS_LIVE         = int(os.environ.get("MAX_ATTEMPTS_LIVE",  "2"))
+MAX_ATTEMPTS_NORMAL       = MAX_ATTEMPTS_TRAIN  # compat: valor por defecto antes de cargar estado
+
+def get_session_max_signals() -> int:
+    return SESSION_MAX_SIGNALS_LIVE if is_trained else SESSION_MAX_SIGNALS_TRAIN
+
+def get_max_attempts() -> int:
+    return MAX_ATTEMPTS_LIVE if is_trained else MAX_ATTEMPTS_TRAIN
+
+def nivel_columna_label(n: int) -> str:
+    return f"C{n}"
 GAME_LINK = "https://1win.lat/casino/play/v_pragmatic:spaceman"
 
 # Umbral de confirmación previa al envío: si al detectar el patrón la última
@@ -455,8 +478,9 @@ def calc_pct_rangos(vals: List[float]) -> tuple:
     return (rango1 / total) * 100, (rango2 / total) * 100
 
 # Umbrales de tendencia favorable/desfavorable (ajustables por env)
-TREND_RANGO1_MAX = float(os.environ.get("TREND_RANGO1_MAX", "54"))
-TREND_RANGO2_MIN = float(os.environ.get("TREND_RANGO2_MIN", "28"))
+# Favorable ⇔ 1.00x-1.99x < 54.01% Y 2.00x-4.99x > 27.99% (últimas 200 rondas)
+TREND_RANGO1_MAX = float(os.environ.get("TREND_RANGO1_MAX", "54.01"))
+TREND_RANGO2_MIN = float(os.environ.get("TREND_RANGO2_MIN", "27.99"))
 
 def calc_pct_rangos_full(vals: List[float]) -> tuple:
     """Devuelve (conteo_rango1, conteo_rango2, pct_rango1, pct_rango2) sobre las últimas 200 rondas."""
@@ -475,12 +499,14 @@ def calc_pct_rangos_full(vals: List[float]) -> tuple:
 def build_signal_msg(tipo_label: str, last_value: float, sesion_index: int,
                      pct_rango1: float, pct_rango2: float,
                      ronda_predicha: Optional[int] = None) -> str:
-    # Formato fijo de señal — sin línea de ronda predicha por el ML de timing.
+    # Formato fijo de señal — nivel de columna (C1/C2/C3) en vez de contador
+    # de sesión; sin línea de ronda predicha por el ML de timing.
+    nivel = nivel_columna_label(sesion_index)
     return (
         f"<b>✅✅ ENTRADA CONFIRMADA ✅✅</b>\n\n"
         f"👉 INGRESAR DESPUÉS: {last_value:.2f}x\n"
         f"💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x\n\n"
-        f"🧠 GESTIÓN MASSANIELLO: {sesion_index}/5\n"
+        f"🧠 NIVEL DE COLUMNA: {nivel}\n"
         f"📈 TENDENCIA 200 RONDAS\n"
         f"🔵 1.00x-1.99x = {pct_rango1:.2f}%\n"
         f"🟢 2.00x-4.99x = {pct_rango2:.2f}%\n\n"
@@ -494,10 +520,19 @@ def build_win_msg(result: float, intento: int) -> str:
         f"<b>✅ Resultado: {result:.2f}x — INTENTO {intento}</b>"
     )
 
-def build_loss_msg(intento: int, result: float) -> str:
+def build_loss_msg(intento: int, result: float, de: Optional[int] = None) -> str:
+    total = de if de is not None else get_max_attempts()
     return (
         f"🧠 <b>INTENTO FALLIDO!!! Resultado: {result:.2f}x</b>\n"
-        f"💥 Mantener la calma intento {intento} de 5"
+        f"💥 Mantener la calma intento {intento} de {total}"
+    )
+
+def build_retry_attempt_msg(intento: int, total: int, result: float) -> str:
+    """Aviso de que el nivel sigue activo: falló un intento pero quedan más
+    intentos seguidos dentro del mismo nivel (C1/C2/C3) antes de resolverlo."""
+    return (
+        f"🧠 <b>INTENTO {intento} FALLIDO — Resultado: {result:.2f}x</b>\n"
+        f"🔁 Va el intento {intento + 1} de {total} — misma entrada"
     )
 
 def build_win_status_msg(intento: int) -> str:
@@ -626,6 +661,8 @@ def save_state():
         "is_last_signal_of_session": "1" if is_last_signal_of_session else "0",
         "pending_confirmation": "1" if pending_confirmation else "0",
         "pending_confirmation_data": json.dumps(pending_confirmation_data) if pending_confirmation_data else "",
+        "is_trained": "1" if is_trained else "0",
+        "sig_favorable": "1" if sig_favorable else "0",
     }
     _save_dict(values)
 
@@ -636,6 +673,8 @@ def load_state():
     global ml_last_trained_count, timing_last_trained_count
     global session_signal_count, pending_signal_index, is_last_signal_of_session
     global pending_confirmation, pending_confirmation_data
+    global is_trained
+    global sig_favorable
 
     d = _load_dict()
     sig_state         = d.get("sig_state", "idle") or "idle"
@@ -661,7 +700,7 @@ def load_state():
     ml_last_trained_count = int(d.get("ml_last_trained_count", "0") or "0")
     timing_last_trained_count = int(d.get("timing_last_trained_count", "0") or "0")
     session_signal_count = int(d.get("session_signal_count", "0") or "0")
-    if session_signal_count < 0 or session_signal_count > 5:
+    if session_signal_count < 0 or session_signal_count > SESSION_MAX_SIGNALS_TRAIN:
         session_signal_count = 0
     pending_signal_index = int(d.get("pending_signal_index", "0") or "0")
     is_last_signal_of_session = (d.get("is_last_signal_of_session", "0") or "0") == "1"
@@ -671,6 +710,8 @@ def load_state():
         pending_confirmation_data = json.loads(_pcd) if _pcd else None
     except (TypeError, ValueError):
         pending_confirmation_data = None
+    is_trained = (d.get("is_trained", "0") or "0") == "1"
+    sig_favorable = (d.get("sig_favorable", "1") or "1") == "1"
     logger.info(
         f"[v21] Estado cargado | estado={sig_state} sesion={session_signal_count} "
         f"esperando_confirmacion={pending_confirmation}"
@@ -835,6 +876,12 @@ pending_signal_index: int        = 0
 is_last_signal_of_session: bool  = False
 current_session_results: List[bool] = []  # almacena wins/losses de la sesión actual
 trend_msg_id: Optional[int] = None
+is_trained: bool = False  # False = fase de entrenamiento silenciosa; True = en vivo
+# True = la señal activa se emitió con tendencia favorable (pct1<TREND_RANGO1_MAX
+# y pct2>TREND_RANGO2_MIN) y por lo tanto SÍ se envía a Telegram. False = se
+# procesa igual en 2 planos (log_pattern_result + signal_contexts) para
+# entrenar los modelos, pero no se manda ningún mensaje al chat.
+sig_favorable: bool = True
 
 # ─── CONFIRMACIÓN PREVIA AL ENVÍO (nuevo) ────────────────────────────────────
 # Si el patrón se detecta pero la última cuota registrada ya fue ≥2x, la señal
@@ -1313,6 +1360,41 @@ def construir_matriz_timing(df):
     x = x.select_dtypes(include=["number", "bool"]).astype(float)
     return x, y, cat_cols_presentes
 
+async def maybe_finish_training():
+    """Al alcanzar TRAINING_SIGNALS_REQUIRED señales de tiempo resueltas, se
+    entrena el modelo de timing con ellas y se pasa a modo EN VIVO (sesión de
+    3 niveles C1/C2/C3, 2 intentos por nivel, señales visibles en Telegram)."""
+    global is_trained, timing_model, timing_feature_columns, timing_categorical_columns, timing_last_trained_count
+    if is_trained:
+        return
+    total_ctx = count_resolved_contexts()
+    if total_ctx < TRAINING_SIGNALS_REQUIRED:
+        return
+    logger.info(f"[Timing ML] 🎓 {total_ctx} señales de entrenamiento recopiladas — entrenando modelo...")
+    if ML_LIBS_OK:
+        loop = asyncio.get_running_loop()
+        ok, artifact, msg = await loop.run_in_executor(None, train_timing_model_in_thread, TRAINING_SIGNALS_REQUIRED)
+        if ok:
+            joblib.dump(artifact, TIMING_MODEL_FILE)
+            timing_model = artifact["model"]
+            timing_feature_columns = artifact["feature_columns"]
+            timing_categorical_columns = artifact["categorical_columns"]
+            timing_last_trained_count = total_ctx
+            logger.info(f"[Timing ML] ✅ Modelo entrenado: {msg}")
+        else:
+            logger.warning(f"[Timing ML] ⚠️ No se pudo entrenar ({msg}) — se pasa a modo EN VIVO igual")
+    else:
+        logger.warning("[Timing ML] ⚠️ Librerías de ML no disponibles — se pasa a modo EN VIVO sin modelo entrenado")
+    is_trained = True
+    save_state()
+    logger.info("[Timing ML] 🚀 Modo EN VIVO activado: sesión de 3 niveles (C1/C2/C3), 2 intentos por nivel")
+    await send_signal_msg(
+        "🎓 <b>Entrenamiento completo</b>\n"
+        f"Se recopilaron {total_ctx} señales de entrenamiento.\n"
+        "A partir de ahora las señales se envían en vivo — niveles C1/C2/C3, "
+        "2 intentos seguidos por nivel."
+    )
+
 # ─── MÁQUINA DE ESTADOS ──────────────────────────────────────────────────────
 async def resolve_active(value: float, signal_index: int):
     global sig_state, sig_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
@@ -1320,8 +1402,25 @@ async def resolve_active(value: float, signal_index: int):
     global sig_context_json, sig_signal_id
     global session_signal_count, pending_signal_index, is_last_signal_of_session
     global current_session_results
+    global is_trained
+    global sig_favorable
 
     win = value >= CASHOUT_TRIGGER
+    # sig_favorable quedó fijado en emit_signal() para ESTA señal activa —
+    # se usa para decidir si sus mensajes de resultado van a Telegram.
+    favorable_actual = sig_favorable
+
+    # Si perdió pero todavía quedan intentos dentro de ESTE nivel (en vivo:
+    # 2 intentos seguidos por nivel C1/C2/C3), no se resuelve todavía: se
+    # espera la próxima ronda para el siguiente intento, sin avanzar de nivel.
+    if not win and sig_attempt < sig_last_attempt:
+        sig_attempt += 1
+        logger.info(f"[v21] 🔁 Intento {sig_attempt-1}/{sig_last_attempt} fallido — va el intento {sig_attempt} (misma entrada)")
+        if is_trained and favorable_actual:
+            await send_signal_msg(build_retry_attempt_msg(sig_attempt - 1, sig_last_attempt, value))
+        save_state()
+        return
+
     label = sig_tipo or "Señal"
     key = sig_tipo_key or "desconocido"
 
@@ -1350,8 +1449,8 @@ async def resolve_active(value: float, signal_index: int):
                                     f"(fail_count={r['fail_count']})")
                         break
 
+    attempt_when_win = sig_attempt if win else None
     if sig_signal_id and sig_context_json:
-        attempt_when_win = signal_index if win else None
         result = "win" if win else "loss"
         update_signal_context_result(sig_signal_id, attempt_when_win, result)
 
@@ -1360,15 +1459,18 @@ async def resolve_active(value: float, signal_index: int):
     if win:
         logger.info(f"[v21] ✅ GANAMOS — {value:.2f}x | {label}")
         log_pattern_result(key, label, "win", value, attempt=signal_index, features_json=sig_features)
-        await send_signal_msg(build_win_msg(value, signal_index))
-        await send_stats_msg(build_win_status_msg(signal_index))
+        if is_trained and favorable_actual:
+            await send_signal_msg(build_win_msg(value, sig_attempt))
+            await send_stats_msg(build_win_status_msg(sig_attempt))
     else:
         logger.info(f"[v21] ❌ PERDIMOS — {value:.2f}x | {label}")
         log_pattern_result(key, label, "loss", value, attempt=signal_index, features_json=sig_features)
-        await send_signal_msg(build_loss_msg(signal_index, value))
-        await send_stats_msg(build_loss_status_msg(signal_index))
+        if is_trained and favorable_actual:
+            await send_signal_msg(build_loss_msg(sig_attempt, value, de=sig_last_attempt))
+            await send_stats_msg(build_loss_status_msg(sig_attempt))
 
-    await update_trend_status_msg(list(history), resolved=True)
+    if is_trained and favorable_actual:
+        await update_trend_status_msg(list(history), resolved=True)
 
     # Limpiar estado de señal ANTES de evaluar la sesión: send_stats_update()
     # exige sig_state=="idle" para enviar, así que si se limpia después, el
@@ -1382,26 +1484,27 @@ async def resolve_active(value: float, signal_index: int):
     sig_inmediata = False
     sig_context_json = None
     sig_signal_id = None
+    sig_favorable = True
 
-    # La sesión termina apenas se gana UNA señal (en cualquier intento del 1 al 5)
-    # — no hace falta llegar a la 5ta —, o cuando se pierden las 5 seguidas sin
-    # ningún acierto.
+    # La sesión termina apenas se gana UN nivel (C1, C2 o C3), o cuando se
+    # pierden todos los niveles de la sesión sin ningún acierto.
     session_ends = win or is_last_signal_of_session
     if session_ends:
-        session_won = win  # si llegamos acá por is_last_signal_of_session sin ganar, ya perdió las 5
+        session_won = win  # si llegamos acá por is_last_signal_of_session sin ganar, ya perdió todos los niveles
+        max_niveles = get_session_max_signals()
         if session_won:
             daily_wins += 1
             consecutive_wins += 1
             consecutive_losses = 0
-            logger.info(f"[v21] 🏆 Sesión GANADA (acierto en el intento {signal_index}/5)")
+            logger.info(f"[v21] 🏆 Sesión GANADA (acierto en el nivel {pending_signal_index}/{max_niveles})")
         else:
             daily_losses += 1
             consecutive_losses += 1
             # Cada sesión perdida resetea la racha de victorias consecutivas.
             consecutive_wins = 0
-            # Enviar mensaje de sesión fallida con el último valor
-            await send_signal_msg(build_session_loss_msg(value))
-            logger.info(f"[v22] ❌ Sesión PERDIDA (5 intentos fallidos, sin aciertos) — racha ganada reseteada")
+            if is_trained and favorable_actual:
+                await send_signal_msg(build_session_loss_msg(value))
+            logger.info(f"[v22] ❌ Sesión PERDIDA ({max_niveles} niveles fallidos, sin aciertos) — racha ganada reseteada")
 
         # Resetear estado de sesión
         current_session_results = []
@@ -1411,7 +1514,13 @@ async def resolve_active(value: float, signal_index: int):
         save_state()
         # Mensaje de estadísticas de sesión (resultado del día, % acierto,
         # racha) — va al chat de señales, igual que el resto de los avisos.
-        await send_stats_update()
+        if is_trained and favorable_actual:
+            await send_stats_update()
+        # Chequeo de fin de fase de entrenamiento: se hace entre sesiones,
+        # nunca a mitad de una, para no cambiar niveles/intentos con una
+        # sesión ya en curso.
+        if not is_trained:
+            await maybe_finish_training()
 
     save_state()
 
@@ -1422,6 +1531,7 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     global sig_state, sig_attempt, sig_last_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
     global sig_emit_attempt, sig_context_json, sig_signal_id
     global session_signal_count, pending_signal_index, is_last_signal_of_session
+    global sig_favorable
 
     signal_id = f"{tipo_key}_{int(datetime.utcnow().timestamp() * 1000)}"
     sig_signal_id = signal_id
@@ -1451,9 +1561,11 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
         sig_emit_attempt = 1
         sig_context_json = None
 
-    # Incrementar contador de sesión
+    # Incrementar contador de sesión (niveles dentro de la sesión: 6 en
+    # fase de entrenamiento, 3 —C1/C2/C3— en vivo).
+    max_niveles = get_session_max_signals()
     pending_signal_index = session_signal_count + 1
-    is_last_signal_of_session = (pending_signal_index == 5)
+    is_last_signal_of_session = (pending_signal_index == max_niveles)
     if is_last_signal_of_session:
         session_signal_count = 0
     else:
@@ -1468,88 +1580,58 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     sig_inmediata = True
     sig_state = "active"
     sig_attempt = 1
-    sig_last_attempt = MAX_ATTEMPTS_NORMAL
+    sig_last_attempt = get_max_attempts()
 
-    text = build_signal_msg(label, value, pending_signal_index, pct1, pct2, ronda_predicha=ronda_predicha)
-    sig_msg_id = await send_signal_msg(text, no_preview=True)
+    # Condición de tendencia favorable: 1.00x-1.99x < TREND_RANGO1_MAX% (54.01%)
+    # Y 2.00x-4.99x > TREND_RANGO2_MIN% (27.99%), sobre las últimas 200 rondas.
+    # Las señales que caen en tendencia DESFAVORABLE se procesan igual (quedan
+    # registradas en log_signal_context/log_pattern_result para entrenar los
+    # modelos — "2 planos": contexto de la señal + resultado del patrón) pero
+    # NUNCA se envían a Telegram, sin importar la fase (entrenamiento o vivo).
+    sig_favorable = pct1 < TREND_RANGO1_MAX and pct2 > TREND_RANGO2_MIN
+
+    if is_trained and sig_favorable:
+        text = build_signal_msg(label, value, pending_signal_index, pct1, pct2, ronda_predicha=ronda_predicha)
+        sig_msg_id = await send_signal_msg(text, no_preview=True)
+    else:
+        sig_msg_id = None
     save_state()
     origen = "confirmada tras espera <2x" if confirmada_por_espera else "directa"
-    logger.info(f"[v21] ⚡ Señal emitida ({origen}): {tipo_key} — {motivo} (señal {pending_signal_index}/5)")
+    fase = "EN VIVO" if is_trained else "ENTRENAMIENTO (silencioso)"
+    tendencia = "FAVORABLE" if sig_favorable else "DESFAVORABLE (2 planos, sin Telegram)"
+    logger.info(f"[v21] ⚡ Señal emitida ({origen}, {fase}, tendencia {tendencia}): {tipo_key} — {motivo} "
+                f"(nivel {pending_signal_index}/{max_niveles}, intentos/nivel: {sig_last_attempt}, "
+                f"pct1={pct1:.2f}%, pct2={pct2:.2f}%)")
 
 # ─── PROCESAMIENTO CENTRAL — v21 ─────────────────────────────────────────────
 async def process_new_value(value: float, silent: bool = False):
     global last_result, history
     global sig_state, pending_signal_index
-    global pending_confirmation, pending_confirmation_data
 
     history.append(value)
     if len(history) > HISTORY_MAX:
         history = history[-HISTORY_MAX:]
     save_value(value)
-    # Se alimentan siempre, aunque el modo sea silencioso (carga inicial de
-    # historial), para que el predictor de tiempo y las líneas calientes
-    # arranquen con contexto real desde el primer dato disponible.
+    # Se alimenta siempre, aunque el modo sea silencioso (carga inicial de
+    # historial), para que el predictor de tiempo arranque con contexto real
+    # desde el primer dato disponible.
     calcular_prediccion_inteligente(value)
     if silent:
         return
-    log_hotline_snapshot(list(history))
     logger.info(f"Nueva cuota: {value:.2f}x | hist:{len(history)} | estado:{sig_state}")
 
     if sig_state == "active":
         await resolve_active(value, pending_signal_index)
         return
 
-    # Confirmación previa al envío: si hay una señal pendiente de una ronda
-    # anterior (patrón detectado con la última cuota ≥ CONFIRM_BELOW), se
-    # espera a que esta ronda resulte < CONFIRM_BELOW para recién emitirla.
-    if pending_confirmation:
-        if value < CONFIRM_BELOW:
-            data = pending_confirmation_data
-            pending_confirmation = False
-            pending_confirmation_data = None
-            save_state()
-            if data:
-                await emit_signal(value, data["tipo_key"], data["label"], data["motivo"],
-                                   data["features_json"], confirmada_por_espera=True)
-            return
-        else:
-            # Sigue ≥ CONFIRM_BELOW: se mantiene pendiente, no se evalúan
-            # nuevos patrones mientras se espera la confirmación.
-            logger.info(f"[v21] ⏳ Confirmación pendiente — cuota {value:.2f}x aún ≥ {CONFIRM_BELOW:.2f}x")
-            return
-
     vals = list(history)
-    await update_trend_status_msg(vals, resolved=False)
+    if is_trained:
+        await update_trend_status_msg(vals, resolved=False)
 
-    # Señal de tiempo: SOLO si ESTA ronda cayó dentro de la franja de 15-30s
-    # antes del horario predicho del rebote 3x-5x, dispara la entrada.
-    # Si dispara, termina acá.
+    # Única fuente de señales: el predictor de horario (rebote 3x-5x). Las
+    # señales de tendencia (cruce EMA) y líneas calientes 5x/10x se
+    # eliminaron — se dejan solamente las señales de tiempo.
     await check_timing_round_trigger()
-    if sig_state == "active":
-        return
-
-    resultado = evaluate_signal(vals)
-    if not resultado:
-        return
-
-    # Solo se consideran señales cuando la tendencia general (200 rondas) es
-    # favorable — mismo criterio que get_stats()/pct_below2/pct_2to5.
-    if not get_stats()["favorable"]:
-        logger.info("[v22] ⏸️ Tendencia NO favorable — señal detectada pero descartada")
-        return
-
-    tipo_key, label, motivo, features_json, es_inmediata = resultado
-
-    if value >= CONFIRM_BELOW:
-        pending_confirmation = True
-        pending_confirmation_data = {
-            "tipo_key": tipo_key, "label": label, "motivo": motivo, "features_json": features_json,
-        }
-        save_state()
-        logger.info(f"[v21] ⏸️ Patrón detectado con cuota {value:.2f}x ≥ {CONFIRM_BELOW:.2f}x — esperando confirmación")
-        return
-
-    await emit_signal(value, tipo_key, label, motivo, features_json, confirmada_por_espera=False)
 
 # ─── CONEXIÓN WEBSOCKET — Pragmatic Play (Spaceman) ──────────────────────────
 # Estructura real confirmada con tráfico en vivo (log DEBUG_WS_PAYLOAD): cada
@@ -1746,17 +1828,17 @@ async def cmd_start(message):
     await bot.reply_to(message,
         f"🚀 <b>¡Bienvenido {name}!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <b>SPACEMAN BOT v22 — SEÑALES DEL GRÁFICO DE TENDENCIA</b>\n"
+        "🤖 <b>SPACEMAN BOT v23 — SOLO SEÑALES DE TIEMPO</b>\n"
         f"💰 <b>Retiro único: {CASHOUT_TARGET:.2f}x</b>\n"
-        "📈 <b>Señal: cruce EMA4/8/20 del gráfico de tendencia</b>\n"
-        "⏰ <b>Señal de tiempo: rebote 3x-5x (predictor de horario)</b>\n"
-        "🟡🟣 <b>Líneas calientes 5x/10x: feature de ML, no disparan solas</b>\n"
-        "🧠 <b>Gestión Massaniello: hasta 5 señales por sesión (corta al primer acierto)</b>\n"
+        "⏰ <b>Única señal: predictor de horario (rebote 3x-5x)</b>\n"
+        f"🎓 <b>Entrenamiento: {TRAINING_SIGNALS_REQUIRED} señales silenciosas (no van a Telegram)</b>\n"
+        "🧠 <b>En vivo: sesión de 3 niveles C1/C2/C3 — 2 intentos por nivel</b>\n"
         "📈 <b>Estadísticas por sesión (no por señal)</b>\n"
         "📡 <b>Fuente: Spaceman — Pragmatic Play (WebSocket)</b>\n"
         f"📈 <b>Estado Actual</b>\n"
         f"   Historial: {len(history)} cuotas\n"
         f"   Favorable: {'✅' if stats['favorable'] else '❌'}\n"
+        f"   Fase: {'🟢 EN VIVO' if is_trained else f'🎓 ENTRENANDO ({count_resolved_contexts()}/{TRAINING_SIGNALS_REQUIRED})'}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
@@ -1782,7 +1864,8 @@ async def cmd_stats(message):
         f"✅ Sesiones Ganadas: {daily_wins} | ❌ Sesiones Perdidas: {daily_losses}\n"
         f"💎 Acierto de Sesiones: {pct:.1f}%\n"
         f"📈 Racha de Sesiones Ganadas: {consecutive_wins}\n"
-        f"🧠 Sesión actual: {sesion_actual}/5\n"
+        f"🧠 Sesión actual: {sesion_actual}/{get_session_max_signals()}\n"
+        f"🎓 Fase: {'EN VIVO' if is_trained else f'ENTRENANDO ({count_resolved_contexts()}/{TRAINING_SIGNALS_REQUIRED})'}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
