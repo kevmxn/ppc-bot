@@ -752,6 +752,7 @@ def save_state():
         "pending_confirmation_data": json.dumps(pending_confirmation_data) if pending_confirmation_data else "",
         "is_trained": "1" if is_trained else "0",
         "sig_favorable": "1" if sig_favorable else "0",
+        "sig_shadow": "1" if sig_shadow else "0",
         "sig_retry_msg_id": str(sig_retry_msg_id) if sig_retry_msg_id is not None else "",
         "sig_attempt_values": json.dumps(sig_attempt_values),
     }
@@ -765,7 +766,7 @@ def load_state():
     global session_signal_count, pending_signal_index, is_last_signal_of_session
     global pending_confirmation, pending_confirmation_data
     global is_trained
-    global sig_favorable
+    global sig_favorable, sig_shadow
     global sig_retry_msg_id, sig_attempt_values
 
     d = _load_dict()
@@ -804,6 +805,7 @@ def load_state():
         pending_confirmation_data = None
     is_trained = (d.get("is_trained", "0") or "0") == "1"
     sig_favorable = (d.get("sig_favorable", "1") or "1") == "1"
+    sig_shadow = (d.get("sig_shadow", "0") or "0") == "1"
     _rmid = d.get("sig_retry_msg_id", "")
     sig_retry_msg_id = int(_rmid) if _rmid else None
     _sav = d.get("sig_attempt_values", "")
@@ -981,6 +983,13 @@ is_trained: bool = False  # False = fase de entrenamiento silenciosa; True = en 
 # procesa igual en 2 planos (log_pattern_result + signal_contexts) para
 # entrenar los modelos, pero no se manda ningún mensaje al chat.
 sig_favorable: bool = True
+# True = la señal activa es "sombra": se emitió con tendencia DESFAVORABLE, así
+# que aunque se resuelva (win/loss) NO avanza ni termina la sesión visible
+# (C1/C2/C3) — pending_signal_index/session_signal_count quedan congelados en
+# el nivel pendiente real. Se sigue registrando en 2 planos para el ML. Al
+# volver la tendencia a favorable, la sesión continúa en el mismo nivel donde
+# quedó pendiente, sin saltar niveles por señales sombra que el usuario nunca vio.
+sig_shadow: bool = False
 sig_retry_msg_id: Optional[int] = None  # id del mensaje "REPETIR ENTRADA" del intento 1, para poder borrarlo al resolver el nivel
 sig_attempt_values: List[float] = []  # cuotas de cada intento del nivel activo (C1/C2/C3), para "Resultados Señal Cx: ..."
 
@@ -1504,13 +1513,15 @@ async def resolve_active(value: float, signal_index: int):
     global session_signal_count, pending_signal_index, is_last_signal_of_session
     global current_session_results
     global is_trained
-    global sig_favorable
+    global sig_favorable, sig_shadow
     global sig_retry_msg_id, sig_attempt_values
 
     win = value >= CASHOUT_TRIGGER
-    # sig_favorable quedó fijado en emit_signal() para ESTA señal activa —
-    # se usa para decidir si sus mensajes de resultado van a Telegram.
+    # sig_favorable/sig_shadow quedaron fijados en emit_signal() para ESTA
+    # señal activa — favorable decide si sus mensajes van a Telegram; shadow
+    # decide si esta señal puede tocar el estado de la sesión visible.
     favorable_actual = sig_favorable
+    shadow_actual = sig_shadow
     sig_attempt_values.append(value)
 
     # Si perdió pero todavía quedan intentos dentro de ESTE nivel (en vivo:
@@ -1558,7 +1569,8 @@ async def resolve_active(value: float, signal_index: int):
         result = "win" if win else "loss"
         update_signal_context_result(sig_signal_id, attempt_when_win, result)
 
-    current_session_results.append(win)
+    if not shadow_actual:
+        current_session_results.append(win)
 
     if win:
         logger.info(f"[v21] ✅ GANAMOS — {value:.2f}x | {label}")
@@ -1601,8 +1613,28 @@ async def resolve_active(value: float, signal_index: int):
     sig_context_json = None
     sig_signal_id = None
     sig_favorable = True
+    sig_shadow = False
     sig_retry_msg_id = None
     sig_attempt_values = []
+
+    if shadow_actual:
+        # Señal SOMBRA resuelta (tendencia desfavorable): no toca la sesión
+        # visible. pending_signal_index se restaura al valor congelado de
+        # session_signal_count (el que ya tenía ANTES de esta señal sombra),
+        # e is_last_signal_of_session vuelve a False, replicando el mismo
+        # invariante de "idle entre niveles" que usa la sesión real. Así,
+        # cuando la tendencia vuelva a ser favorable, la próxima señal sigue
+        # exactamente en el nivel pendiente real (C1/C2/C3), sin haber
+        # avanzado ni terminado la sesión por señales que el usuario nunca vio.
+        pending_signal_index = session_signal_count
+        is_last_signal_of_session = False
+        logger.info(
+            f"[v22] 🌒 Señal sombra resuelta ({'win' if win else 'loss'}, tendencia desfavorable) — "
+            f"sesión real sigue pendiente en nivel "
+            f"{nivel_senal_label(session_signal_count) if session_signal_count else '(sin sesión activa)'}"
+        )
+        save_state()
+        return
 
     # La sesión termina apenas se gana UN nivel (C1, C2 o C3), o cuando se
     # pierden todos los niveles de la sesión sin ningún acierto.
@@ -1657,7 +1689,7 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     global sig_state, sig_attempt, sig_last_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
     global sig_emit_attempt, sig_context_json, sig_signal_id
     global session_signal_count, pending_signal_index, is_last_signal_of_session
-    global sig_favorable
+    global sig_favorable, sig_shadow
     global sig_retry_msg_id, sig_attempt_values
 
     signal_id = f"{tipo_key}_{int(datetime.utcnow().timestamp() * 1000)}"
@@ -1690,18 +1722,39 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
         sig_emit_attempt = 1
         sig_context_json = None
 
-    # Incrementar contador de sesión (niveles dentro de la sesión: 6 en
-    # fase de entrenamiento, 3 —C1/C2/C3— en vivo).
-    max_niveles = get_session_max_signals()
-    pending_signal_index = session_signal_count + 1
-    is_last_signal_of_session = (pending_signal_index == max_niveles)
-    if is_last_signal_of_session:
-        session_signal_count = 0
-    else:
-        session_signal_count = pending_signal_index
-
-    # Calcular porcentajes de rangos sobre las últimas 200 rondas
+    # Calcular porcentajes de rangos y favorabilidad ANTES de decidir si esta
+    # señal ocupa un nivel real de la sesión visible o es una señal SOMBRA.
     pct1, pct2 = calc_pct_rangos(list(history))
+    # Condición de tendencia favorable: 1.00x-1.99x < TREND_RANGO1_MAX% (54.01%)
+    # Y 2.00x-4.99x > TREND_RANGO2_MIN% (27.99%), sobre las últimas 200 rondas.
+    favorable = pct1 < TREND_RANGO1_MAX and pct2 > TREND_RANGO2_MIN
+    sig_favorable = favorable
+
+    # Niveles dentro de la sesión: 6 en fase de entrenamiento, 3 —C1/C2/C3— en vivo.
+    max_niveles = get_session_max_signals()
+
+    if is_trained and not favorable:
+        # Señal SOMBRA: tendencia desfavorable en modo EN VIVO. Se procesa
+        # igual (queda registrada en log_signal_context/log_pattern_result
+        # para entrenar los modelos — "2 planos") y NUNCA se envía a Telegram,
+        # pero NO avanza ni termina la sesión visible: pending_signal_index se
+        # usa solo para etiquetar/loggear ESTA señal sombra, y
+        # session_signal_count queda CONGELADO. Así, cuando la tendencia
+        # vuelva a ser favorable, la sesión real sigue exactamente en el mismo
+        # nivel pendiente (C1/C2/C3), sin haber saltado de nivel por señales
+        # que el usuario nunca vio.
+        sig_shadow = True
+        pending_signal_index = session_signal_count + 1
+        is_last_signal_of_session = (pending_signal_index == max_niveles)
+    else:
+        # Señal real: sí avanza/consume un nivel de la sesión visible.
+        sig_shadow = False
+        pending_signal_index = session_signal_count + 1
+        is_last_signal_of_session = (pending_signal_index == max_niveles)
+        if is_last_signal_of_session:
+            session_signal_count = 0
+        else:
+            session_signal_count = pending_signal_index
 
     sig_tipo = label
     sig_tipo_key = tipo_key
@@ -1711,14 +1764,6 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     sig_attempt = 1
     sig_last_attempt = get_max_attempts()
 
-    # Condición de tendencia favorable: 1.00x-1.99x < TREND_RANGO1_MAX% (54.01%)
-    # Y 2.00x-4.99x > TREND_RANGO2_MIN% (27.99%), sobre las últimas 200 rondas.
-    # Las señales que caen en tendencia DESFAVORABLE se procesan igual (quedan
-    # registradas en log_signal_context/log_pattern_result para entrenar los
-    # modelos — "2 planos": contexto de la señal + resultado del patrón) pero
-    # NUNCA se envían a Telegram, sin importar la fase (entrenamiento o vivo).
-    sig_favorable = pct1 < TREND_RANGO1_MAX and pct2 > TREND_RANGO2_MIN
-
     if is_trained and sig_favorable:
         text = build_signal_msg(label, value, pending_signal_index, pct1, pct2, ronda_predicha=ronda_predicha)
         sig_msg_id = await send_signal_msg(text, no_preview=True)
@@ -1727,7 +1772,7 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     save_state()
     origen = "confirmada tras espera <2x" if confirmada_por_espera else "directa"
     fase = "EN VIVO" if is_trained else "ENTRENAMIENTO (silencioso)"
-    tendencia = "FAVORABLE" if sig_favorable else "DESFAVORABLE (2 planos, sin Telegram)"
+    tendencia = "FAVORABLE" if sig_favorable else "DESFAVORABLE (sombra, sesión congelada, sin Telegram)" if sig_shadow else "DESFAVORABLE (2 planos, sin Telegram)"
     logger.info(f"[v21] ⚡ Señal emitida ({origen}, {fase}, tendencia {tendencia}): {tipo_key} — {motivo} "
                 f"(nivel {pending_signal_index}/{max_niveles}, intentos/nivel: {sig_last_attempt}, "
                 f"pct1={pct1:.2f}%, pct2={pct2:.2f}%)")
