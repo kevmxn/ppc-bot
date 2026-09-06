@@ -21,7 +21,6 @@ SPACEMAN HTML Strategy Bot — Telegram + Render  [v22 — Señales del gráfico
   la probabilidad de éxito en los últimos intentos.
 """
 import asyncio
-import time
 import sqlite3
 import sys
 import threading
@@ -1553,34 +1552,28 @@ async def process_new_value(value: float, silent: bool = False):
     await emit_signal(value, tipo_key, label, motivo, features_json, confirmada_por_espera=False)
 
 # ─── CONEXIÓN WEBSOCKET — Pragmatic Play (Spaceman) ──────────────────────────
-# Estructura real confirmada en VB.html (script oficial del panel): cada
-# mensaje trae `data.gameResult`, y el HTML de referencia SOLO lee
-# `gameResult[0].result` — no hay ningún id de ronda ni timestamp por ítem
-# en el payload, es la única fuente confiable. Hubo dos versiones previas
-# de este bloque con bugs opuestos:
-#  v1: deduplicaba SOLO por valor de cuota (`val == last_result`) → dos
-#      rondas distintas con la misma cuota se fusionaban en una sola.
-#  v2: deduplicaba por un campo "id"/"timestamp" adivinado que no existe en
-#      el payload real → sin ese campo, el fallback trataba cada mensaje
-#      como distinto y la MISMA ronda se contaba como varias rondas nuevas.
-# Fix definitivo (alineado a VB.html): se toma solo gameResult[0], igual que
-# el HTML oficial, y se combina valor + una ventana mínima de tiempo real
-# entre rondas: un mensaje con la MISMA cuota que la última procesada solo
-# se acepta como ronda nueva si pasó al menos ROUND_MIN_GAP_SEC segundos
-# desde la última — menos que eso es, con altísima probabilidad, el mismo
-# resultado reenviado (heartbeat/reconexión), no una ronda distinta.
-ROUND_MIN_GAP_SEC = float(os.environ.get("ROUND_MIN_GAP_SEC", "3.0"))
-
-# Log temporal para confirmar con tráfico real cuántas rondas trae cada
-# mensaje "gameResult" de Pragmatic. Activar con DEBUG_WS_PAYLOAD=1 en el
-# entorno, mirar los logs un rato, y después desactivarlo (o dejarlo en 0,
-# que es el valor por defecto) para no ensuciar el log en producción.
-DEBUG_WS_PAYLOAD = os.environ.get("DEBUG_WS_PAYLOAD", "0") == "1"
-
+# Estructura real confirmada con tráfico en vivo (log DEBUG_WS_PAYLOAD): cada
+# mensaje del WS trae un HISTORIAL de ~20 rondas (no una ronda nueva por
+# mensaje), ordenadas de más nueva a más vieja, cada una con su propio
+# "gameId" (numérico, único y creciente) y "time". Ejemplo real:
+#   [{"gameId": "17505677920", "result": "15.99", "time": "..."},
+#    {"gameId": "17505677820", "result": "1.12",  "time": "..."}, ...]
+# Los dos intentos anteriores fallaron porque asumían que el mensaje traía
+# una sola ronda nueva y comparaban solo el valor de la cuota (o una ventana
+# de tiempo): como el mismo historial se reenvía en cada mensaje, la cuota
+# "más reciente" aparecía repetida en mensajes sucesivos y se perdían o
+# duplicaban rondas según el enfoque.
+# Fix definitivo: se usa el "gameId" real (nunca el valor de la cuota) para
+# saber qué rondas son nuevas. En cada mensaje se procesan, en orden
+# cronológico, todas las rondas del historial cuyo gameId sea posterior al
+# último gameId ya procesado.
 ws_conn_status = "disconnected"   # disconnected | connecting | connected | error
 ws_conn_detail  = ""
-last_round_value: Optional[float] = None
-last_round_time: Optional[float] = None
+last_game_id: Optional[int] = None
+
+# Log temporal para inspeccionar el payload crudo. DEBUG_WS_PAYLOAD=1 en el
+# entorno lo activa; dejar en 0 (default) en producción normal.
+DEBUG_WS_PAYLOAD = os.environ.get("DEBUG_WS_PAYLOAD", "0") == "1"
 
 def set_ws_status(state: str, detail: str = ""):
     global ws_conn_status, ws_conn_detail
@@ -1588,28 +1581,21 @@ def set_ws_status(state: str, detail: str = ""):
     ws_conn_detail = detail
 
 def _get_val(item: dict) -> Optional[float]:
-    # "result" es el campo real (VB.html: firstResult.result). multiplier/
-    # crashPoint quedan como fallback defensivo por si la fuente cambia.
-    v = item.get("result") or item.get("multiplier") or item.get("crashPoint")
+    v = item.get("result")
     try:
         return float(v) if v is not None else None
     except (TypeError, ValueError):
         return None
 
-def _is_new_round(val: float, now: float) -> bool:
-    """True si `val` corresponde a una ronda distinta de la última procesada.
-    Cuota distinta -> siempre ronda nueva. Cuota igual -> solo se acepta como
-    ronda nueva si pasó suficiente tiempo real (ROUND_MIN_GAP_SEC) desde la
-    anterior; si no, se asume que es el mismo resultado reenviado."""
-    global last_round_value, last_round_time
-    if last_round_value is None:
-        return True
-    if val != last_round_value:
-        return True
-    return (now - last_round_time) >= ROUND_MIN_GAP_SEC
+def _get_game_id(item: dict) -> Optional[int]:
+    v = item.get("gameId")
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
 
 async def ws_loop():
-    global last_round_value, last_round_time
+    global last_game_id
     RECONNECT_DELAY = 5
     set_ws_status("connecting", "🟡 CONECTANDO...")
     while True:
@@ -1635,17 +1621,40 @@ async def ws_loop():
                             f"[DEBUG_WS] gameResult trae {len(game_results)} elemento(s) | "
                             f"contenido: {json.dumps(game_results, default=str)}"
                         )
-                    # Igual que VB.html: se toma solo gameResult[0] (la
-                    # ronda actual que reporta el panel oficial).
-                    item = game_results[0]
-                    val = _get_val(item)
-                    if val is not None:
-                        now = time.monotonic()
-                        if _is_new_round(val, now):
-                            last_round_value = val
-                            last_round_time = now
+                    # Parseamos cada item del historial: (gameId, valor).
+                    parsed = []
+                    for item in game_results:
+                        gid = _get_game_id(item)
+                        val = _get_val(item)
+                        if gid is None or val is None:
+                            continue
+                        parsed.append((gid, val))
+                    if not parsed:
+                        continue
+
+                    if last_game_id is None:
+                        # Primer mensaje: fijamos el punto de partida en la
+                        # ronda más reciente del historial, SIN procesar las
+                        # 19 rondas viejas como si fueran nuevas (mismo
+                        # criterio de "sin backfill" que la versión anterior).
+                        last_game_id = max(gid for gid, _ in parsed)
+                        set_ws_status("connected", f"🟢 CONECTADO — punto de partida: gameId {last_game_id}")
+                        logger.info(f"Punto de partida fijado en gameId {last_game_id} (sin backfill de historial)")
+                        continue
+
+                    nuevos = [(gid, val) for gid, val in parsed if gid > last_game_id]
+                    if nuevos:
+                        # El historial viene de más nueva a más vieja: se
+                        # ordena ascendente para procesar en orden cronológico
+                        # y no invertir la secuencia real de rondas.
+                        nuevos.sort(key=lambda x: x[0])
+                        for gid, val in nuevos:
+                            last_game_id = gid
                             set_ws_status("connected", f"🟢 CONECTADO — nueva ronda: {val:.2f}x")
                             await process_new_value(val, silent=False)
+                    else:
+                        set_ws_status("connected", "🟢 CONECTADO — sin rondas nuevas")
+
                     try:
                         await check_timing_predictions()
                     except Exception as e:
