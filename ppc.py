@@ -33,6 +33,11 @@ SPACEMAN HTML Strategy Bot — Telegram + Render  [v22 — Señales del gráfico
   favorable_actual/sig_favorable (tendencia de rangos + resto de filtros
   nuevos); ya no depende de is_trained. Las señales sombra (tendencia
   desfavorable) se siguen ocultando igual que antes, en cualquier fase.
+- NUEVO: Se movió el filtro de tendencia favorable (pct1/pct2 vs
+  TREND_RANGO1_MAX/TREND_RANGO2_MIN) al inicio de check_timing_round_trigger.
+  Ya no se generan señales sombra: si la tendencia es desfavorable, la ronda
+  se descarta antes de armar candidatos — solo se consideran/procesan
+  señales de tendencia favorable, de punta a punta.
 """
 import asyncio
 import sqlite3
@@ -566,6 +571,11 @@ async def check_timing_round_trigger():
     tres_emas = calc_tres_emas_status(list(history))
     if not tres_emas['sobre_tres_emas']:
         return
+    pct1, pct2 = calc_pct_rangos(list(history))
+    favorable_ahora = pct1 < TREND_RANGO1_MAX and pct2 > TREND_RANGO2_MIN
+    if not favorable_ahora:
+        logger.info(f"[Timing] 🛑 Tendencia desfavorable (pct1={pct1:.2f}%, pct2={pct2:.2f}%) — no se dispara")
+        return
     nivel_actual = session_signal_count + 1
     if nivel_actual > get_session_max_signals():
         logger.info(f"[Timing] 🛑 Gestión de dinero: columnas agotadas "
@@ -788,6 +798,7 @@ def build_stats_msg() -> str:
     return (
         f"🚀 <b>Resultado del día ✅ {daily_wins} | ⭕ {daily_losses}</b>\n"
         f"💎 <b>Acertamos el {pct:.2f}% de las Sesiones</b>\n"
+        f"🔥 <b>¡{consecutive_signal_wins} Señales ganadas Consecutivas!</b>\n"
         f"📈 <b>¡{consecutive_wins} Sesiones Ganadas Consecutivas!</b>"
     )
 
@@ -878,6 +889,7 @@ def save_state():
         "daily_losses":     str(daily_losses),
         "consecutive_wins": str(consecutive_wins),
         "consecutive_losses": str(consecutive_losses),
+        "consecutive_signal_wins": str(consecutive_signal_wins),
         "ml_last_trained_count": str(ml_last_trained_count),
         "timing_last_trained_count": str(timing_last_trained_count),
         "session_signal_count": str(session_signal_count),
@@ -897,7 +909,7 @@ def save_state():
 def load_state():
     global sig_state, sig_attempt, sig_last_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features
     global sig_inmediata, sig_emit_attempt, sig_context_json, sig_signal_id, stats_msg_id
-    global daily_wins, daily_losses, consecutive_wins, consecutive_losses
+    global daily_wins, daily_losses, consecutive_wins, consecutive_losses, consecutive_signal_wins
     global ml_last_trained_count, timing_last_trained_count
     global session_signal_count, pending_signal_index, is_last_signal_of_session
     global pending_confirmation, pending_confirmation_data
@@ -927,6 +939,7 @@ def load_state():
     daily_losses      = int(d.get("daily_losses", "0"))
     consecutive_wins  = int(d.get("consecutive_wins", "0"))
     consecutive_losses = int(d.get("consecutive_losses", "0"))
+    consecutive_signal_wins = int(d.get("consecutive_signal_wins", "0") or "0")
     ml_last_trained_count = int(d.get("ml_last_trained_count", "0") or "0")
     timing_last_trained_count = int(d.get("timing_last_trained_count", "0") or "0")
     session_signal_count = int(d.get("session_signal_count", "0") or "0")
@@ -1115,6 +1128,11 @@ daily_wins:        int           = 0
 daily_losses:      int           = 0
 consecutive_wins:  int           = 0
 consecutive_losses: int          = 0
+# Racha de señales (niveles C1/C2/C3) ganadas seguidas, independiente de las
+# sesiones: cada nivel ganado (en 1er o 2do intento) suma 1; cualquier nivel
+# perdido la resetea a 0. Solo cuenta señales favorables (las que se envían
+# a Telegram), igual criterio que daily_wins/daily_losses.
+consecutive_signal_wins: int      = 0
 session_signal_count: int        = 0
 pending_signal_index: int        = 0
 is_last_signal_of_session: bool  = False
@@ -1651,7 +1669,7 @@ async def maybe_finish_training():
 # ─── MÁQUINA DE ESTADOS ──────────────────────────────────────────────────────
 async def resolve_active(value: float, signal_index: int):
     global sig_state, sig_attempt, sig_msg_id, sig_tipo, sig_tipo_key, sig_features, sig_inmediata
-    global daily_wins, daily_losses, consecutive_wins, consecutive_losses
+    global daily_wins, daily_losses, consecutive_wins, consecutive_losses, consecutive_signal_wins
     global sig_context_json, sig_signal_id
     global session_signal_count, pending_signal_index, is_last_signal_of_session
     global current_session_results
@@ -1720,6 +1738,9 @@ async def resolve_active(value: float, signal_index: int):
         logger.info(f"[v21] ✅ GANAMOS — {value:.2f}x | {label}")
         log_pattern_result(key, label, "win", value, attempt=signal_index, features_json=sig_features)
         if favorable_actual:
+            # Señal (nivel C1/C2/C3) ganada — suma a la racha de señales,
+            # independiente de si esto además cierra la sesión.
+            consecutive_signal_wins += 1
             if sig_retry_msg_id:
                 await delete_msg(sig_retry_msg_id)
                 sig_retry_msg_id = None
@@ -1729,6 +1750,8 @@ async def resolve_active(value: float, signal_index: int):
         logger.info(f"[v21] ❌ PERDIMOS — {value:.2f}x | {label}")
         log_pattern_result(key, label, "loss", value, attempt=signal_index, features_json=sig_features)
         if favorable_actual:
+            # Señal (nivel C1/C2/C3) perdida — resetea la racha de señales.
+            consecutive_signal_wins = 0
             if sig_retry_msg_id:
                 await delete_msg(sig_retry_msg_id)
                 sig_retry_msg_id = None
@@ -1808,10 +1831,16 @@ async def resolve_active(value: float, signal_index: int):
             if contabiliza:
                 daily_losses += 1
                 consecutive_losses += 1
-                # Cada sesión perdida resetea la racha de victorias consecutivas.
-                consecutive_wins = 0
+                # La racha de sesiones ganadas consecutivas solo se corta al
+                # perder 3 sesiones SEGUIDAS (antes se cortaba con la primera
+                # derrota); hasta 2 derrotas seguidas no la afectan.
+                if consecutive_losses >= 3:
+                    consecutive_wins = 0
                 await send_signal_msg(build_session_loss_msg(value))
-            logger.info(f"[v22] ❌ Sesión PERDIDA ({max_niveles} niveles fallidos, sin aciertos) — racha ganada reseteada"
+            racha_txt = ("racha ganada reseteada (3 derrotas seguidas)" if contabiliza and consecutive_losses >= 3
+                         else f"racha ganada intacta ({consecutive_losses}/3 derrotas seguidas)" if contabiliza
+                         else "racha ganada reseteada")
+            logger.info(f"[v22] ❌ Sesión PERDIDA ({max_niveles} niveles fallidos, sin aciertos) — {racha_txt}"
                         + ("" if contabiliza else " — no contabilizada (no se envió a Telegram)"))
 
         # Resetear estado de sesión
@@ -1872,39 +1901,22 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
         sig_emit_attempt = 1
         sig_context_json = None
 
-    # Calcular porcentajes de rangos y favorabilidad ANTES de decidir si esta
-    # señal ocupa un nivel real de la sesión visible o es una señal SOMBRA.
+    # Porcentajes de rangos para mostrar en el mensaje — la tendencia ya se
+    # validó como favorable en check_timing_round_trigger antes de llegar
+    # acá (única fuente: solo se consideran señales de tendencia favorable,
+    # ya no hay señales sombra).
     pct1, pct2 = calc_pct_rangos(list(history))
-    # Condición de tendencia favorable: 1.00x-1.99x < TREND_RANGO1_MAX% (52.51%)
-    # Y 2.00x-4.99x > TREND_RANGO2_MIN% (27.99%), sobre las últimas 200 rondas.
-    favorable = pct1 < TREND_RANGO1_MAX and pct2 > TREND_RANGO2_MIN
-    sig_favorable = favorable
+    sig_favorable = True
+    sig_shadow = False
 
     # Niveles dentro de la sesión: 6 en fase de entrenamiento, 3 —C1/C2/C3— en vivo.
     max_niveles = get_session_max_signals()
-
-    if not favorable:
-        # Señal SOMBRA: tendencia desfavorable (en cualquier fase). Se procesa
-        # igual (queda registrada en log_signal_context/log_pattern_result
-        # para entrenar los modelos — "2 planos") y NUNCA se envía a Telegram,
-        # pero NO avanza ni termina la sesión visible: pending_signal_index se
-        # usa solo para etiquetar/loggear ESTA señal sombra, y
-        # session_signal_count queda CONGELADO. Así, cuando la tendencia
-        # vuelva a ser favorable, la sesión real sigue exactamente en el mismo
-        # nivel pendiente (C1/C2/C3), sin haber saltado de nivel por señales
-        # que el usuario nunca vio.
-        sig_shadow = True
-        pending_signal_index = session_signal_count + 1
-        is_last_signal_of_session = (pending_signal_index == max_niveles)
+    pending_signal_index = session_signal_count + 1
+    is_last_signal_of_session = (pending_signal_index == max_niveles)
+    if is_last_signal_of_session:
+        session_signal_count = 0
     else:
-        # Señal real: sí avanza/consume un nivel de la sesión visible.
-        sig_shadow = False
-        pending_signal_index = session_signal_count + 1
-        is_last_signal_of_session = (pending_signal_index == max_niveles)
-        if is_last_signal_of_session:
-            session_signal_count = 0
-        else:
-            session_signal_count = pending_signal_index
+        session_signal_count = pending_signal_index
 
     sig_tipo = label
     sig_tipo_key = tipo_key
@@ -2188,6 +2200,7 @@ async def cmd_stats(message):
         f"✅ Sesiones Ganadas: {daily_wins} | ❌ Sesiones Perdidas: {daily_losses}\n"
         f"💎 Acierto de Sesiones: {pct:.1f}%\n"
         f"📈 Racha de Sesiones Ganadas: {consecutive_wins}\n"
+        f"🔥 Racha de Señales Ganadas: {consecutive_signal_wins}\n"
         f"🧠 Sesión actual: {sesion_actual}/{get_session_max_signals()}\n"
         f"🎓 Fase: {'EN VIVO' if is_trained else f'ENTRENANDO ({count_resolved_contexts()}/{TRAINING_SIGNALS_REQUIRED})'}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
@@ -2213,13 +2226,13 @@ async def self_ping_loop():
             logger.warning(f"Self-ping falló: {e}")
 
 async def daily_reset_loop():
-    global daily_wins, daily_losses, consecutive_wins, consecutive_losses
+    global daily_wins, daily_losses, consecutive_wins, consecutive_losses, consecutive_signal_wins
     while True:
         now = colombia_now()
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         await asyncio.sleep((next_midnight - now).total_seconds())
         await send_stats_msg("🤑 <b>Resultados del día</b>\n" + build_stats_msg())
-        daily_wins = daily_losses = consecutive_wins = consecutive_losses = 0
+        daily_wins = daily_losses = consecutive_wins = consecutive_losses = consecutive_signal_wins = 0
         save_state()
         logger.info("🔄 Estadísticas reiniciadas — 00:00 Colombia")
 
