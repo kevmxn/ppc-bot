@@ -19,6 +19,20 @@ SPACEMAN HTML Strategy Bot — Telegram + Render  [v22 — Señales del gráfico
 - NUEVO: Acumulación de fuerza por fallos en señales de tiempo. Cada fallo
   reduce la ventana de anticipación y amplía la ventana posterior, aumentando
   la probabilidad de éxito en los últimos intentos.
+- NUEVO: Filtro de confirmación de tendencia para la señal de tiempo 3x-5x
+  (réplica de precioSobreTresEMAs del HTML): solo dispara si la posición
+  actual del gráfico de tendencia está por encima de EMA4, EMA8 y EMA20 a
+  la vez. Si no está alineado, se espera sin cortar las predicciones activas.
+- NUEVO: Filtro duro de gestión de dinero (réplica del límite de la
+  Estrategia Dinero Real del HTML: Martingale 2 intentos x 3 columnas, sin
+  simular capital/apuestas en $). Si la sesión ya agotó SESSION_MAX_SIGNALS
+  columnas, check_timing_round_trigger no dispara más señales de tiempo.
+- NUEVO: Las señales ahora se envían a Telegram desde la fase de
+  ENTRENAMIENTO (antes solo se registraban en la DB hasta completar
+  TRAINING_SIGNALS_REQUIRED). El único filtro para enviar sigue siendo
+  favorable_actual/sig_favorable (tendencia de rangos + resto de filtros
+  nuevos); ya no depende de is_trained. Las señales sombra (tendencia
+  desfavorable) se siguen ocultando igual que antes, en cualquier fase.
 """
 import asyncio
 import sqlite3
@@ -27,6 +41,8 @@ import threading
 import json
 import logging
 import os
+import math
+import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 from flask import Flask, request
@@ -92,6 +108,11 @@ HOTLINE_DECAY_ROUNDS  = int(os.environ.get("HOTLINE_DECAY_ROUNDS", "6"))
 TIMING_HIGH_THRESHOLD   = float(os.environ.get("TIMING_HIGH_THRESHOLD", "3.00"))
 TIMING_HISTORY_MAX      = int(os.environ.get("TIMING_HISTORY_MAX", "15"))
 TIMING_SAMPLE_WINDOW    = int(os.environ.get("TIMING_SAMPLE_WINDOW", "5"))
+# Ventana (en rondas) para la volatilidad reciente que se agrega como feature
+# del modelo de timing, y cuántos resultados de señales SOMBRA recientes se
+# conservan para medir "humedad" del patrón durante tendencia desfavorable.
+TIMING_VOLATILITY_WINDOW = int(os.environ.get("TIMING_VOLATILITY_WINDOW", "20"))
+SHADOW_RESULTS_MAX        = int(os.environ.get("SHADOW_RESULTS_MAX", "10"))
 # El horario predicho es el momento estimado en que caerá la próxima ronda
 # 3x-5x (el "rebote"). La señal de ENTRADA SOLO se procesa si una ronda real
 # cae dentro de la franja de 15 a 30 segundos ANTES de ese horario (es decir,
@@ -146,15 +167,17 @@ CASHOUT_TRIGGER = 2.00
 # ─── FASE DE ENTRENAMIENTO / EN VIVO ──────────────────────────────────────
 # Las primeras TRAINING_SIGNALS_REQUIRED señales de tiempo se usan SOLO para
 # entrenar el modelo (nunca se envían a Telegram, solo se registran en la DB).
-# En esa fase la sesión usa hasta SESSION_MAX_SIGNALS_TRAIN señales de 1
-# intento cada una. Al llegar a ese número se entrena el modelo y se pasa a
-# modo EN VIVO: sesión de SESSION_MAX_SIGNALS_LIVE niveles (C1/C2/C3),
+# En esa fase la sesión usa hasta SESSION_MAX_SIGNALS_TRAIN señales de
+# MAX_ATTEMPTS_TRAIN intentos cada una (igual que en vivo: 2 intentos por
+# señal), para que el dataset de entrenamiento ya contemple el comportamiento
+# de reintento dentro del nivel. Al llegar a ese número se entrena el modelo y
+# se pasa a modo EN VIVO: sesión de SESSION_MAX_SIGNALS_LIVE niveles (C1/C2/C3),
 # MAX_ATTEMPTS_LIVE intentos seguidos por nivel — la sesión se pierde si se
 # pierden todos los niveles.
 TRAINING_SIGNALS_REQUIRED = int(os.environ.get("TRAINING_SIGNALS_REQUIRED", "120"))
 SESSION_MAX_SIGNALS_TRAIN = int(os.environ.get("SESSION_MAX_SIGNALS_TRAIN", "6"))
 SESSION_MAX_SIGNALS_LIVE  = int(os.environ.get("SESSION_MAX_SIGNALS_LIVE",  "3"))
-MAX_ATTEMPTS_TRAIN        = int(os.environ.get("MAX_ATTEMPTS_TRAIN", "1"))
+MAX_ATTEMPTS_TRAIN        = int(os.environ.get("MAX_ATTEMPTS_TRAIN", "2"))
 MAX_ATTEMPTS_LIVE         = int(os.environ.get("MAX_ATTEMPTS_LIVE",  "2"))
 MAX_ATTEMPTS_NORMAL       = MAX_ATTEMPTS_TRAIN  # compat: valor por defecto antes de cargar estado
 
@@ -339,6 +362,11 @@ def log_hotline_snapshot(vals: List[float]):
 # ═══════════════════════════════════════════════════════════════════════════
 historial_valores_altos: List[Dict] = []   # {'valor','tiempo_seg'}
 recorded_times: List[Dict] = []            # {'tiempo_seg','pre_alert_shown','alert_shown','created','fail_count'}
+# Resultados (win/loss) de las últimas SHADOW_RESULTS_MAX señales SOMBRA
+# (tendencia desfavorable) ya resueltas — se usa como feature de "humedad" del
+# patrón para el modelo de timing (shadow_win_rate_reciente/shadow_last_result),
+# sin que estas señales cuenten para la sesión visible.
+shadow_results_recent: List[bool] = []
 # tiempo_seg de la predicción cuya señal de tiempo PERDIÓ y aún está dentro
 # de los -10s posteriores al horario predicho: habilita el reenvío de un
 # nuevo intento con la ronda siguiente (sin esperar un patrón nuevo).
@@ -393,34 +421,131 @@ async def check_timing_predictions():
         vigentes.append(r)
     recorded_times = vigentes
 
-def build_timing_features(nivel_actual: int, intento_global: int) -> dict:
+def calc_volatilidad_reciente(vals: List[float], window: int) -> float:
+    """Desvío estándar de las últimas `window` rondas — mide qué tan errático
+    está el juego ahora mismo (una tanda muy volátil puede necesitar una
+    ventana de entrada distinta a una tanda estable)."""
+    if not vals:
+        return 0.0
+    muestra = vals[-window:] if len(vals) > window else vals
+    if len(muestra) < 2:
+        return 0.0
+    return statistics.pstdev(muestra)
+
+def calc_racha_sin_2x(vals: List[float]) -> int:
+    """Cantidad de rondas consecutivas (desde la más reciente hacia atrás)
+    que NO llegaron a 2.00x — cuánto lleva "seco" el juego sin pagar."""
+    racha = 0
+    for v in reversed(vals):
+        if v >= 2.00:
+            break
+        racha += 1
+    return racha
+
+def calc_ema4_rapida(vals: List[float]) -> float:
+    """EMA4 del gráfico de tendencia (posiciones ≥2x/<2x) como feature de
+    momentum de corto plazo, reutilizando la misma réplica exacta de
+    calculateEMAForTrend() que usa la señal de tendencia."""
+    positions = calc_trend_positions(vals)
+    ema4 = calc_ema_trend(positions, 4)
+    return ema4[-1] if ema4 else 0.0
+
+def calc_tres_emas_status(vals: List[float]) -> dict:
+    """Réplica de `precioSobreTresEMAs` del panel HTML: posición actual del
+    gráfico de tendencia por encima de EMA4, EMA8 Y EMA20 a la vez (mismo
+    filtro que el HTML usa para confirmar 'Skrill 2.0'). Se usa como gate de
+    confirmación de tendencia para la señal de tiempo 3x-5x."""
+    out = {'sobre_tres_emas': False, 'pos_actual': None, 'ema4': None, 'ema8': None, 'ema20': None}
+    positions = calc_trend_positions(vals)
+    ema4 = calc_ema_trend(positions, 4)
+    ema8 = calc_ema_trend(positions, 8)
+    ema20 = calc_ema_trend(positions, 20)
+    if not positions or not ema4 or not ema8 or not ema20:
+        return out
+    idx_now = len(vals) - 1
+    e4 = _ema_at(ema4, 4, idx_now)
+    e8 = _ema_at(ema8, 8, idx_now)
+    e20 = _ema_at(ema20, 20, idx_now)
+    if None in (e4, e8, e20):
+        return out
+    pos_actual = positions[-1]
+    out.update({
+        'sobre_tres_emas': pos_actual > e4 and pos_actual > e8 and pos_actual > e20,
+        'pos_actual': pos_actual, 'ema4': e4, 'ema8': e8, 'ema20': e20,
+    })
+    return out
+
+def shadow_win_rate_reciente() -> float:
+    """Fracción de wins entre las últimas SHADOW_RESULTS_MAX señales SOMBRA
+    (tendencia desfavorable) ya resueltas. 0.5 (neutral) si todavía no hay
+    ninguna registrada."""
+    if not shadow_results_recent:
+        return 0.5
+    return sum(1 for w in shadow_results_recent if w) / len(shadow_results_recent)
+
+def shadow_last_result_feature() -> int:
+    """1 = la última señal sombra ganó, 0 = perdió, -1 = todavía no hay ninguna."""
+    if not shadow_results_recent:
+        return -1
+    return 1 if shadow_results_recent[-1] else 0
+
+def build_timing_features(nivel_actual: int, intento_global: int, fail_count: int = 0) -> dict:
     """Features de la señal de tiempo (ventana 3x-5x), incluyendo el nivel de
-    señal (C1/C2/C3) y el intento global (1-6: C1=1-2, C2=3-4, C3=5-6) como
-    features numéricas, para que el modelo de ML aprenda a ajustar el horario
-    de entrada de forma independiente por cada nivel/intento."""
-    ultimo_valor = history[-1] if history else 0.0
+    señal (C1/C2/C3) y el intento global (1-6: C1=1-2, C2=3-4, C3=5-6), más un
+    conjunto de features adicionales pensadas para mejorar la predicción del
+    horario de entrada: fail_count del candidato, volatilidad reciente, racha
+    sin llegar a 2x, hora del día (seno/coseno), valor y gap del último rebote
+    3x-5x, momentum de corto plazo (EMA4 de tendencia) y el resultado/racha de
+    las señales sombra más recientes (humedad del patrón en tendencia
+    desfavorable), para que el modelo de ML aprenda a ajustar el horario de
+    forma independiente por cada nivel/intento y contexto de mercado."""
+    hist = list(history)
+    ultimo_valor = hist[-1] if hist else 0.0
+    ahora = colombia_now()
+    tiempo_actual = ahora.hour * 3600 + ahora.minute * 60 + ahora.second
+    angulo = 2 * math.pi * (tiempo_actual / 86400)
+    if historial_valores_altos:
+        ultimo_rebote = historial_valores_altos[-1]
+        valor_ultimo_rebote = ultimo_rebote['valor']
+        gap_ultimo_rebote = (tiempo_actual - ultimo_rebote['tiempo']) % 86400
+    else:
+        valor_ultimo_rebote = 0.0
+        gap_ultimo_rebote = 0
+    tres_emas = calc_tres_emas_status(hist)
     return {
         'tipo_key': 'timing_3x_5x',
         'ultimo_valor': ultimo_valor,
         'confidence': 60,
         'tendencia_lucky': 'AMARILLO',
         'agresiva_condicion': False,
-        'ema4': None, 'ema8': None, 'ema20': None, 'ema50': None,
+        'ema4': tres_emas['ema4'], 'ema8': tres_emas['ema8'], 'ema20': tres_emas['ema20'], 'ema50': None,
+        'precio_sobre_tres_emas': tres_emas['sobre_tres_emas'],
         'votos': {}, 'contar_entrar': 0, 'contar_no_entrar': 0, 'risk_score': 0,
         'rsi': None, 'macd': None, 'fuerza': None, 'ia_prob': None,
         'racha_rango_activa': False, 'rango_activo': "3.00x-5.00x",
         'nivel_actual': nivel_actual,
         'intento_global': intento_global,
+        # ── Features agregadas para mejorar la predicción de timing ──
+        'fail_count_actual': fail_count,
+        'volatilidad_reciente': calc_volatilidad_reciente(hist, TIMING_VOLATILITY_WINDOW),
+        'racha_sin_2x': calc_racha_sin_2x(hist),
+        'hora_sin': math.sin(angulo),
+        'hora_cos': math.cos(angulo),
+        'valor_ultimo_rebote_3x5x': valor_ultimo_rebote,
+        'gap_ultimo_rebote_seg': gap_ultimo_rebote,
+        'ema4_rapida': calc_ema4_rapida(hist),
+        'shadow_win_rate_reciente': shadow_win_rate_reciente(),
+        'shadow_last_result': shadow_last_result_feature(),
     }
 
-def score_timing_candidate(nivel_actual: int, intento_global: int, diff: float) -> float:
+def score_timing_candidate(nivel_actual: int, intento_global: int, diff: float, fail_count: int = 0) -> float:
     """Puntúa una predicción de horario candidata para el nivel/intento dado.
     Con modelo de timing entrenado: probabilidad de éxito estimada (suma de
     win_1..win_4). Sin modelo todavía: se prioriza la predicción más cercana
     al horario exacto (diff más chico), como aproximación razonable de
     'la que mejor' mientras se recolectan datos."""
     if timing_model is not None:
-        pred = predict_timing(build_timing_features(nivel_actual, intento_global))
+        pred = predict_timing(build_timing_features(nivel_actual, intento_global, fail_count))
         if pred:
             return sum(v for k, v in pred.items() if k.startswith('win_'))
     return -abs(diff)
@@ -438,7 +563,14 @@ async def check_timing_round_trigger():
     global recorded_times, timing_retry_pred
     if sig_state != "idle" or pending_confirmation:
         return
+    tres_emas = calc_tres_emas_status(list(history))
+    if not tres_emas['sobre_tres_emas']:
+        return
     nivel_actual = session_signal_count + 1
+    if nivel_actual > get_session_max_signals():
+        logger.info(f"[Timing] 🛑 Gestión de dinero: columnas agotadas "
+                    f"({get_session_max_signals()}x{get_max_attempts()}) — no se dispara")
+        return
     intentos_por_nivel = get_max_attempts()
     intento_global = intento_global_actual(nivel_actual, 1, intentos_por_nivel)
     ahora = colombia_now()
@@ -466,10 +598,11 @@ async def check_timing_round_trigger():
         return
 
     mejor_r, mejor_diff, era_primera = max(
-        candidatos, key=lambda c: score_timing_candidate(nivel_actual, intento_global, c[1])
+        candidatos, key=lambda c: score_timing_candidate(nivel_actual, intento_global, c[1], c[0].get('fail_count', 0))
     )
     umbral = timing_min_prob_nivel(nivel_actual)
-    mejor_score = score_timing_candidate(nivel_actual, intento_global, mejor_diff)
+    mejor_fail_count = mejor_r.get('fail_count', 0)
+    mejor_score = score_timing_candidate(nivel_actual, intento_global, mejor_diff, mejor_fail_count)
     if is_trained and timing_model is not None and mejor_score < umbral:
         logger.info(f"[Timing] ⚠️ Mejor candidato para {nivel_senal_label(nivel_actual)} "
                     f"no alcanza precisión mínima ({mejor_score:.2f} < {umbral:.2f}) — se espera otra ronda")
@@ -479,21 +612,23 @@ async def check_timing_round_trigger():
     timing_retry_pred = None
     if not era_primera:
         logger.info(f"[Timing] 🔁 Reintento de señal de tiempo — {nivel_senal_label(nivel_actual)} "
-                    f"(fail_count={mejor_r.get('fail_count', 0)}, diff={mejor_diff:.0f}s)")
+                    f"(fail_count={mejor_fail_count}, diff={mejor_diff:.0f}s)")
     else:
         logger.info(f"[Timing] ⏰ Enviando señal {nivel_senal_label(nivel_actual)} "
                     f"(intento global {intento_global}/{get_session_max_signals() * intentos_por_nivel}) "
                     f"{mejor_diff:.0f}s antes del rebote, score={mejor_score:.2f} "
-                    f"(fail_count={mejor_r.get('fail_count', 0)})")
-    await emit_timing_signal(nivel_actual, intento_global)
+                    f"(fail_count={mejor_fail_count})")
+    await emit_timing_signal(nivel_actual, intento_global, mejor_fail_count)
 
-async def emit_timing_signal(nivel_actual: int, intento_global: int):
+async def emit_timing_signal(nivel_actual: int, intento_global: int, fail_count: int = 0):
     """Emite la señal de tiempo (ventana 3x-5x) reutilizando el mismo pipeline
     de sesión/ML que la señal de tendencia — el objetivo de retiro sigue
-    siendo 2x. Ya no se bloquea por tendencia general. Incluye nivel_actual e
-    intento_global como features para que el modelo de ML de timing aprenda a
-    ajustar el horario de entrada de forma independiente para C1, C2 y C3."""
-    features = build_timing_features(nivel_actual, intento_global)
+    siendo 2x. Ya no se bloquea por tendencia general. Incluye nivel_actual,
+    intento_global, fail_count y el resto de features de contexto (volatilidad,
+    racha sin 2x, hora del día, último rebote, EMA4 rápida, humedad de señales
+    sombra) para que el modelo de ML de timing aprenda a ajustar el horario de
+    entrada de forma independiente para C1, C2 y C3."""
+    features = build_timing_features(nivel_actual, intento_global, fail_count)
     ultimo_valor = features['ultimo_valor']
     features_json = json.dumps(features, default=str)
     label = "SEÑAL DE TIEMPO 3x-5x ⏰"
@@ -552,8 +687,8 @@ def calc_pct_rangos(vals: List[float]) -> tuple:
     return (rango1 / total) * 100, (rango2 / total) * 100
 
 # Umbrales de tendencia favorable/desfavorable (ajustables por env)
-# Favorable ⇔ 1.00x-1.99x < 54.01% Y 2.00x-4.99x > 27.99% (últimas 200 rondas)
-TREND_RANGO1_MAX = float(os.environ.get("TREND_RANGO1_MAX", "54.01"))
+# Favorable ⇔ 1.00x-1.99x < 52.51% Y 2.00x-4.99x > 29.00% (últimas 200 rondas)
+TREND_RANGO1_MAX = float(os.environ.get("TREND_RANGO1_MAX", "52.51"))
 TREND_RANGO2_MIN = float(os.environ.get("TREND_RANGO2_MIN", "27.99"))
 
 def calc_pct_rangos_full(vals: List[float]) -> tuple:
@@ -753,6 +888,7 @@ def save_state():
         "is_trained": "1" if is_trained else "0",
         "sig_favorable": "1" if sig_favorable else "0",
         "sig_shadow": "1" if sig_shadow else "0",
+        "shadow_results_recent": json.dumps(shadow_results_recent),
         "sig_retry_msg_id": str(sig_retry_msg_id) if sig_retry_msg_id is not None else "",
         "sig_attempt_values": json.dumps(sig_attempt_values),
     }
@@ -768,6 +904,7 @@ def load_state():
     global is_trained
     global sig_favorable, sig_shadow
     global sig_retry_msg_id, sig_attempt_values
+    global shadow_results_recent
 
     d = _load_dict()
     sig_state         = d.get("sig_state", "idle") or "idle"
@@ -806,6 +943,12 @@ def load_state():
     is_trained = (d.get("is_trained", "0") or "0") == "1"
     sig_favorable = (d.get("sig_favorable", "1") or "1") == "1"
     sig_shadow = (d.get("sig_shadow", "0") or "0") == "1"
+    try:
+        shadow_results_recent = json.loads(d.get("shadow_results_recent", "") or "[]")
+        if not isinstance(shadow_results_recent, list):
+            shadow_results_recent = []
+    except (TypeError, ValueError):
+        shadow_results_recent = []
     _rmid = d.get("sig_retry_msg_id", "")
     sig_retry_msg_id = int(_rmid) if _rmid else None
     _sav = d.get("sig_attempt_values", "")
@@ -1515,6 +1658,7 @@ async def resolve_active(value: float, signal_index: int):
     global is_trained
     global sig_favorable, sig_shadow
     global sig_retry_msg_id, sig_attempt_values
+    global shadow_results_recent
 
     win = value >= CASHOUT_TRIGGER
     # sig_favorable/sig_shadow quedaron fijados en emit_signal() para ESTA
@@ -1530,7 +1674,7 @@ async def resolve_active(value: float, signal_index: int):
     if not win and sig_attempt < sig_last_attempt:
         sig_attempt += 1
         logger.info(f"[v21] 🔁 Intento {sig_attempt-1}/{sig_last_attempt} fallido — va el intento {sig_attempt} (misma entrada)")
-        if is_trained and favorable_actual:
+        if favorable_actual:
             nivel_label = nivel_senal_label(pending_signal_index)
             sig_retry_msg_id = await send_signal_msg(build_retry_attempt_msg(nivel_label))
         save_state()
@@ -1575,7 +1719,7 @@ async def resolve_active(value: float, signal_index: int):
     if win:
         logger.info(f"[v21] ✅ GANAMOS — {value:.2f}x | {label}")
         log_pattern_result(key, label, "win", value, attempt=signal_index, features_json=sig_features)
-        if is_trained and favorable_actual:
+        if favorable_actual:
             if sig_retry_msg_id:
                 await delete_msg(sig_retry_msg_id)
                 sig_retry_msg_id = None
@@ -1584,7 +1728,7 @@ async def resolve_active(value: float, signal_index: int):
     else:
         logger.info(f"[v21] ❌ PERDIMOS — {value:.2f}x | {label}")
         log_pattern_result(key, label, "loss", value, attempt=signal_index, features_json=sig_features)
-        if is_trained and favorable_actual:
+        if favorable_actual:
             if sig_retry_msg_id:
                 await delete_msg(sig_retry_msg_id)
                 sig_retry_msg_id = None
@@ -1597,7 +1741,7 @@ async def resolve_active(value: float, signal_index: int):
                 nivel_label, siguiente_label, sig_attempt_values, intento_actual, intento_total))
             await send_stats_msg(build_loss_status_msg(sig_attempt))
 
-    if is_trained and favorable_actual:
+    if favorable_actual:
         await update_trend_status_msg(list(history), resolved=True)
 
     # Limpiar estado de señal ANTES de evaluar la sesión: send_stats_update()
@@ -1628,6 +1772,11 @@ async def resolve_active(value: float, signal_index: int):
         # avanzado ni terminado la sesión por señales que el usuario nunca vio.
         pending_signal_index = session_signal_count
         is_last_signal_of_session = False
+        # Registrar el resultado para la feature de "humedad" del patrón
+        # (shadow_win_rate_reciente/shadow_last_result) del modelo de timing.
+        shadow_results_recent.append(win)
+        if len(shadow_results_recent) > SHADOW_RESULTS_MAX:
+            shadow_results_recent.pop(0)
         logger.info(
             f"[v22] 🌒 Señal sombra resuelta ({'win' if win else 'loss'}, tendencia desfavorable) — "
             f"sesión real sigue pendiente en nivel "
@@ -1643,10 +1792,11 @@ async def resolve_active(value: float, signal_index: int):
         session_won = win  # si llegamos acá por is_last_signal_of_session sin ganar, ya perdió todos los niveles
         max_niveles = get_session_max_signals()
         # Solo se contabilizan en las estadísticas del día las sesiones cuya
-        # señal SÍ se envió a Telegram (en vivo + tendencia favorable). Las
-        # sesiones silenciosas (entrenamiento o tendencia desfavorable) se
-        # siguen registrando para el modelo, pero no suman ni restan acá.
-        contabiliza = is_trained and favorable_actual
+        # señal SÍ se envió a Telegram (tendencia favorable, ya sea en fase
+        # de entrenamiento o en vivo). Las sesiones sombra (tendencia
+        # desfavorable) se siguen registrando para el modelo, pero no suman
+        # ni restan acá.
+        contabiliza = favorable_actual
         if session_won:
             if contabiliza:
                 daily_wins += 1
@@ -1725,7 +1875,7 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     # Calcular porcentajes de rangos y favorabilidad ANTES de decidir si esta
     # señal ocupa un nivel real de la sesión visible o es una señal SOMBRA.
     pct1, pct2 = calc_pct_rangos(list(history))
-    # Condición de tendencia favorable: 1.00x-1.99x < TREND_RANGO1_MAX% (54.01%)
+    # Condición de tendencia favorable: 1.00x-1.99x < TREND_RANGO1_MAX% (52.51%)
     # Y 2.00x-4.99x > TREND_RANGO2_MIN% (27.99%), sobre las últimas 200 rondas.
     favorable = pct1 < TREND_RANGO1_MAX and pct2 > TREND_RANGO2_MIN
     sig_favorable = favorable
@@ -1733,8 +1883,8 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     # Niveles dentro de la sesión: 6 en fase de entrenamiento, 3 —C1/C2/C3— en vivo.
     max_niveles = get_session_max_signals()
 
-    if is_trained and not favorable:
-        # Señal SOMBRA: tendencia desfavorable en modo EN VIVO. Se procesa
+    if not favorable:
+        # Señal SOMBRA: tendencia desfavorable (en cualquier fase). Se procesa
         # igual (queda registrada en log_signal_context/log_pattern_result
         # para entrenar los modelos — "2 planos") y NUNCA se envía a Telegram,
         # pero NO avanza ni termina la sesión visible: pending_signal_index se
@@ -1764,7 +1914,7 @@ async def emit_signal(value: float, tipo_key: str, label: str, motivo: str,
     sig_attempt = 1
     sig_last_attempt = get_max_attempts()
 
-    if is_trained and sig_favorable:
+    if sig_favorable:
         text = build_signal_msg(label, value, pending_signal_index, pct1, pct2, ronda_predicha=ronda_predicha)
         sig_msg_id = await send_signal_msg(text, no_preview=True)
     else:
