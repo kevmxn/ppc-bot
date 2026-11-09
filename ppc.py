@@ -76,7 +76,9 @@ TG_MIN_GAP      = 0.5    # segundos entre mensajes (evita límites de Telegram)
 
 # ── Señales / gestión ──
 MAX_ENTRIES = 3          # entradas reales (intentos) por señal
-LAB_UNIT    = int(os.environ.get("LAB_UNIT", "100"))      # valor de 1 unidad de Labouchere
+LAB_UNIT    = int(os.environ.get("LAB_UNIT", "100"))      # valor de 1 unidad de Labouchere (también la apuesta mínima)
+# Banker sin comisión: todo paga 1:1 salvo ganar con Banker 6 (paga 1:0.50) → la mitad que falta (apuesta/2, redondeada hacia arriba a unidades enteras) se suma al extremo derecho
+LAB_ROUND   = LAB_UNIT                                    # la ficha mínima es 1 unidad (100): todo monto es múltiplo de la unidad
 LAB_START   = [1, 1, 1]                                   # secuencia inicial de Labouchere
 TIE_AMOUNT  = int(os.environ.get("TIE_AMOUNT", "100"))    # apuesta opcional a Tie
 STATS_FILE  = os.environ.get("STATS_FILE", "baccarat_stats.json")
@@ -986,8 +988,7 @@ def build_attempt_message(label: str, sig: "Signal", att: dict) -> str:
     """Mensaje de cada intento (mismo diseño en los 3): lado elegido por el análisis y monto de Labouchere."""
     return ("✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
             f"🕹️ Mesa: {label}\n"
-            f"🏁 Entrada: ${att['stake_amount']} a {side_label(att['bet_side'])}\n"
-            f"🍀 Opcional: ${TIE_AMOUNT} a Tie 🟢\n\n"
+            f"🏁 Entrada: ${att['stake_amount']} a {side_label(att['bet_side'])}\n\n"
             f"🔔 Intento {att['level']} de {MAX_ENTRIES} - Labouchere")
 
 def _strip_suit(label) -> str:
@@ -1102,27 +1103,41 @@ def load_stats():
 # ══════════════════════════════════════════════
 #  GESTIÓN LABOUCHERE (global, persistente)
 # ══════════════════════════════════════════════
+def _fmt_u(x) -> str:
+    """1.0 -> '1' · 1.5 -> '1.5'"""
+    return str(int(x)) if float(x) == int(x) else f"{float(x):g}"
+
+def stake_amount(units) -> int:
+    """Monto a apostar: unidades × LAB_UNIT, siempre múltiplo de la unidad (la ficha mínima) y nunca menor a 1 unidad."""
+    amount = int(round(units * LAB_UNIT / LAB_ROUND)) * LAB_ROUND
+    return max(LAB_UNIT, amount)
+
 class Labouchere:
     """Secuencia 1,1,1 · apuesta = primero + último (extremos) · ganar: se eliminan los extremos ·
-    perder: se agrega lo apostado al final · secuencia vacía = ciclo completo → vuelve a 1,1,1."""
+    perder: se agrega lo apostado al final · secuencia vacía = ciclo completo → vuelve a 1,1,1.
+    Banker sin comisión: todo paga 1:1 salvo ganar con Banker 6 (paga 1:0.50). En ese caso, tras quitar los
+    extremos, la ficha del extremo derecho sube en la otra mitad de lo apostado (apuesta/2 redondeada hacia arriba:
+    la ficha mínima es 1 unidad y no se puede apostar media)."""
     def __init__(self):
         self.seq = list(LAB_START)
 
-    def stake_units(self) -> int:
+    def stake_units(self):
         return self.seq[0] + self.seq[-1] if len(self.seq) > 1 else self.seq[0]
 
-    def on_win(self):
+    def on_win(self, stake_units=1, half: bool = False):
         self.seq = self.seq[1:-1] if len(self.seq) > 1 else []
         if not self.seq:
             self.seq = list(LAB_START)
+        if half:
+            self.seq[-1] += max(1, math.ceil(stake_units / 2))   # lo que faltó por cobrar, en unidades enteras
         self.save()
 
-    def on_loss(self, stake: int):
+    def on_loss(self, stake):
         self.seq.append(stake)
         self.save()
 
     def label(self) -> str:
-        return "-".join(str(x) for x in self.seq)
+        return "-".join(_fmt_u(x) for x in self.seq)
 
     def save(self):
         tmp = LAB_FILE + ".tmp"
@@ -1139,8 +1154,9 @@ class Labouchere:
         try:
             with open(LAB_FILE, "r") as f:
                 seq = json.load(f).get("seq")
-            if isinstance(seq, list) and seq and all(isinstance(x, int) and x > 0 for x in seq):
-                self.seq = seq
+            if (isinstance(seq, list) and seq
+                    and all(isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0 for x in seq)):
+                self.seq = [max(1, math.ceil(x)) for x in seq]      # solo unidades enteras (ficha mínima)
                 log.info(f"Labouchere cargado: {self.label()}")
         except Exception as e:
             log.warning(f"Error cargando Labouchere: {e}")
@@ -1917,12 +1933,12 @@ class BaccaratTable:
             "n_rows": dec["n_rows"], "features": dec["features"],
             "after_tie": bool((dec.get("features") or {}).get("prev_tie")),
             "candidate": dec.get("candidate"),
-            "stake_units": units, "stake_amount": units * LAB_UNIT, "lab_before": list(LAB.seq),
+            "stake_units": units, "stake_amount": stake_amount(units), "lab_before": list(LAB.seq),
         }
         sig.bet_side = bet_side
         sig.attempts.append(att)
         log.info(f"[{self.label}] 🎯 Intento {level}: {bet_side} ({dec['source']}, {_pct(dec['p_keep'])}) "
-                 f"{units}u · Labouchere {LAB.label()}")
+                 f"{_fmt_u(units)}u · Labouchere {LAB.label()}")
         if sig.live:
             sig.attempt_msg = send_attempt(self, sig, att)
         return True
@@ -1948,9 +1964,16 @@ class BaccaratTable:
         att["outcome"] = outcome
         att["keep_won"] = int(r == att["keep_side"])
         ML.learn(att["features"], att["keep_won"], p_keep=att["p_keep"])
+        # Sin comisión: Banker gana con 6 → paga 1:0.50
+        bt = (hand.get("cards") or {}).get("banker_total")
+        if bt is None:
+            bt = hand.get("b")
+        att["half_win"] = bool(outcome == "win" and att["bet_side"] == "B" and bt == 6)
+        if att["half_win"]:
+            log.info(f"[{self.label}] 🔴 Banker gana con 6: paga 1:0.50")
         if sig.live:                             # la gestión Labouchere solo se mueve con señales reales
             if outcome == "win":
-                LAB.on_win()
+                LAB.on_win(att["stake_units"], att["half_win"])
             elif outcome == "loss":
                 LAB.on_loss(att["stake_units"])
         att["lab_after"] = list(LAB.seq)
@@ -2282,7 +2305,7 @@ _server_state: Optional[ServerState] = None
 
 def build_status_message(server_state: ServerState) -> str:
     lines = [STATS.marker_message(), "", ML.training_report_text(), "",
-             f"💰 Labouchere: {LAB.label()} → {LAB.stake_units()} u. (${LAB.stake_units() * LAB_UNIT})",
+             f"💰 Labouchere: {LAB.label()} → {_fmt_u(LAB.stake_units())} u. (${stake_amount(LAB.stake_units())})",
              "🧠 6 estrategias (12 patrones) en 4 gráficos + confirmación de 2 marcas + 3 intentos (solo Baccarat 1)", "", "🎲 MESAS"]
     for t in server_state.tables.values():
         st = t.get_state()
