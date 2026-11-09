@@ -66,7 +66,7 @@ BACCARAT_TABLES = {
 PROVIDER_NAME = "Pragmatic Play"
 
 # ── Telegram ──
-# El token se lee SOLO de la variable de entorno BOT_TOKEN (no lo dejes escrito en el código).
+# El token se lee primero de la variable de entorno BOT_TOKEN; si no existe, se usa el que está escrito aquí.
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "9024770820:AAF6c-tZ2vsFA1OyX1IKIC4TX3QFfxPTUMw")
 CHAT_ID         = int(os.environ.get("CHAT_ID", "-1003906187561"))
 THREAD_SIGNALS  = int(os.environ.get("THREAD_SIGNALS", "14527"))   # chat (tema) de señales
@@ -341,11 +341,14 @@ def validate_cards(c: Optional[dict]) -> Optional[str]:
 
 def validate_hand(h: Optional[dict]) -> Optional[str]:
     """validate_cards + el ganador debe coincidir con los puntajes."""
-    err = validate_cards((h or {}).get("cards"))
-    if err:
-        return err
-    c = h["cards"]
-    pt, bt = sum(c["player_cards"]) % 10, sum(c["banker_cards"]) % 10
+    c = (h or {}).get("cards")
+    if _totals_only_ok(c):
+        pt, bt = c["player_total"], c["banker_total"]      # sin cartas legibles: valen los puntajes 0-9
+    else:
+        err = validate_cards(c)
+        if err:
+            return err
+        pt, bt = sum(c["player_cards"]) % 10, sum(c["banker_cards"]) % 10
     exp = "P" if pt > bt else "B" if bt > pt else "T"
     if h.get("r") in ("P", "B", "T") and h["r"] != exp:
         return f"ganador {h['r']} no coincide con {pt} vs {bt}"
@@ -365,8 +368,37 @@ def slim_raw(raw) -> dict:
             pass
     return out
 
+def _valid_total(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 9
+
+def _totals_only_ok(c: Optional[dict]) -> bool:
+    """Mano sin cartas legibles pero con los dos puntajes (0-9) conocidos: se acepta usando solo los puntajes."""
+    c = c or {}
+    return (not c.get("player_cards") and not c.get("banker_cards")
+            and _valid_total(c.get("player_total")) and _valid_total(c.get("banker_total")))
+
+def _mark_naturals(c: dict):
+    """Natural = 8 o 9 con las 2 primeras cartas (nadie roba). Se guarda True/False; None si no se puede saber."""
+    for side in ("player", "banker"):
+        tot = c.get(f"{side}_total")
+        n = len(c.get(f"{side}_cards") or []) or c.get(f"{side}_raw_n") or 0
+        if not _valid_total(tot):
+            c[f"{side}_natural"] = None
+        elif tot < 8:
+            c[f"{side}_natural"] = False
+        else:
+            c[f"{side}_natural"] = (n == 2) if n else None
+
 def make_hand(raw, gid, r) -> dict:
     cards = parse_baccarat_cards(raw)
+    if validate_cards(cards):
+        # Error al identificar las cartas: se usan los puntajes (0-9) que reporta la API
+        pt, bt = cards.get("player_reported"), cards.get("banker_reported")
+        if _valid_total(pt) and _valid_total(bt):
+            cards.update({"player_cards": [], "banker_cards": [], "player_labels": [], "banker_labels": [],
+                          "player_ncards": 0, "banker_ncards": 0,
+                          "player_total": pt, "banker_total": bt, "cards_ok": False})
+    _mark_naturals(cards)
     return {"gid": gid, "r": r,
             "p": cards["player_total"], "b": cards["banker_total"],
             "cards": cards, "raw": slim_raw(raw)}
@@ -969,13 +1001,15 @@ def _cards_txt(labels, values) -> str:
     return " + ".join(items) or "—"
 
 def build_hands_line(hand: Optional[dict]) -> str:
-    """~ Player [2 + A + Q] = 3 🔵\n    ~ Banker [J + Q + Q] = 0 🔴"""
+    """Solo puntajes (0-9), sin cartas:  Player = 9 🔵 (Natural 9)\n Banker = 4 🔴"""
     h = hand or {}
     c = h.get("cards") or {}
     pt = c.get("player_total") if c.get("player_total") is not None else h.get("p")
     bt = c.get("banker_total") if c.get("banker_total") is not None else h.get("b")
-    return (f"~ Player [{_cards_txt(c.get('player_labels'), c.get('player_cards'))}] = {'—' if pt is None else pt} 🔵\n"
-            f"~ Banker [{_cards_txt(c.get('banker_labels'), c.get('banker_cards'))}] = {'—' if bt is None else bt} 🔴")
+    pn = f" · Natural {pt}" if c.get("player_natural") and pt is not None else ""
+    bn = f" · Natural {bt}" if c.get("banker_natural") and bt is not None else ""
+    return (f"~ Player = {'—' if pt is None else pt} 🔵{pn}\n"
+            f"~ Banker = {'—' if bt is None else bt} 🔴{bn}")
 
 def build_result_message(kind: str, level: int, hand: Optional[dict], side: Optional[str]) -> str:
     """UN solo mensaje: título + manos + resultado con el Win/Loss (los empates ya no se cuentan).
@@ -1551,7 +1585,7 @@ def save_hand(table_key, hand: dict):
     c = hand.get("cards") or {}
     rec = {"t": table_key, "sid": hand.get("shoe_id", 0), "gid": str(hand.get("gid")), "r": hand.get("r"),
            "p": hand.get("p"), "b": hand.get("b"), "ts": int(time.time()),
-           "cards": {k: c.get(k) for k in ("player_cards", "banker_cards", "player_labels", "banker_labels", "player_total", "banker_total")}}
+           "cards": {k: c.get(k) for k in ("player_cards", "banker_cards", "player_labels", "banker_labels", "player_total", "banker_total", "player_natural", "banker_natural")}}
     try:
         with open(HANDS_FILE, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, default=str) + "\n")
@@ -1579,7 +1613,8 @@ def load_hands() -> dict:
                         "cards": {"player_cards": pc, "banker_cards": bc,
                                   "player_labels": c.get("player_labels") or [], "banker_labels": c.get("banker_labels") or [],
                                   "player_ncards": len(pc), "banker_ncards": len(bc),
-                                  "player_total": c.get("player_total"), "banker_total": c.get("banker_total")}}
+                                  "player_total": c.get("player_total"), "banker_total": c.get("banker_total"),
+                                  "player_natural": c.get("player_natural"), "banker_natural": c.get("banker_natural")}}
                 t = rec.get("t")
                 if validate_hand(hand):            # guardada antes con cartas incompletas: no se aprende
                     gap[t] = True
