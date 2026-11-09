@@ -38,6 +38,12 @@ import websockets
 from aiohttp import web, ClientSession, ClientTimeout
 
 try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+
+try:
     from telebot.async_telebot import AsyncTeleBot
     TELEBOT_OK = True
 except ImportError:
@@ -82,6 +88,10 @@ LAB_ROUND   = LAB_UNIT                                    # la ficha mínima es 
 LAB_START   = [1, 1, 1]                                   # secuencia inicial de Labouchere
 TIE_AMOUNT  = int(os.environ.get("TIE_AMOUNT", "100"))    # apuesta opcional a Tie
 STATS_FILE  = os.environ.get("STATS_FILE", "baccarat_stats.json")
+SHOE_IMAGE        = os.environ.get("SHOE_IMAGE", "1") == "1"                         # 1 = cada mensaje de señal/resultado va como pie de la imagen del zapato
+SHOE_IMG_ROUNDS   = 84                                                              # rondas que caben en la imagen (14 columnas × 6 filas)
+KEEP_MESSAGES    = True                                                             # los mensajes (imagen + pie) quedan en el chat: no se borra nada
+SHOE_IMG_ROWS     = 6                                                               # filas (se llena de arriba hacia abajo, columna por columna)
 LAB_FILE    = os.environ.get("LAB_FILE", "baccarat_labouchere.json")
 HANDS_FILE  = os.environ.get("HANDS_FILE", "baccarat_hands.jsonl")   # manos aprendidas (sobreviven a reinicios)
 SHOE_MAX_HANDS = int(os.environ.get("SHOE_MAX_HANDS", "110"))   # 8 mazos ≈ 84-104 manos: más = faltó el aviso de barajado
@@ -968,6 +978,97 @@ async def telegram_sender_loop():
 
 
 # ══════════════════════════════════════════════
+#  IMAGEN DEL ZAPATO (bead plate: 6 filas, se llena por columnas · hasta 84 rondas)
+#  🔵 Player · 🔴 Banker · 🟢 Tie · ⚪ casilla vacía
+# ══════════════════════════════════════════════
+def render_shoe_png(label: str, results: list) -> Optional[bytes]:
+    """PNG del zapato. `results` = lista de 'P'/'B'/'T' en orden. Si hay más de 84 rondas se muestran las últimas 84."""
+    if not PIL_OK:
+        return None
+    import io
+    rows, cap = SHOE_IMG_ROWS, SHOE_IMG_ROUNDS
+    cols = -(-cap // rows)                                    # 84 rondas / 6 filas → 14 columnas
+    total = len(results)
+    shown = results[-cap:]
+    S, cell, pad, head = 3, 56, 18, 58                        # S = supersampling para bordes suaves
+    W, H = pad * 2 + cols * cell, head + pad + rows * cell
+    img = Image.new("RGB", (W * S, H * S), "#14181f")
+    d = ImageDraw.Draw(img)
+
+    def font(size, bold=True):
+        for f in (("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"), "Arial.ttf"):
+            try:
+                return ImageFont.truetype(f, size * S)
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    d.text((pad * S, 14 * S), f"{label} · zapato", fill="#e8eaed", font=font(22))
+    d.text((pad * S, 14 * S), "", fill="#e8eaed")
+    info = f"{min(total, cap)}/{cap}" + (f"  ({total} jugadas)" if total > cap else "")
+    fi = font(20)
+    d.text((W * S - pad * S - d.textlength(info, font=fi), 17 * S), info, fill="#9aa4b2", font=fi)
+    colors = {"P": "#2f6bff", "B": "#e5383b", "T": "#22b455"}
+    r_out = (cell - 10) // 2
+    for slot in range(cap):
+        col, row = divmod(slot, rows)
+        cx = (pad + col * cell + cell // 2) * S
+        cy = (head + row * cell + cell // 2) * S
+        box = [cx - r_out * S, cy - r_out * S, cx + r_out * S, cy + r_out * S]
+        if slot < len(shown):
+            d.ellipse(box, fill=colors.get(shown[slot], "#888888"), outline="#ffffff", width=2 * S)
+            ft = font(20)
+            lab = shown[slot]
+            d.text((cx - d.textlength(lab, font=ft) / 2, cy - 12 * S), lab, fill="#ffffff", font=ft)
+        else:
+            d.ellipse(box, fill="#f4f6f8", outline="#c3cad3", width=2 * S)
+    img = img.resize((W, H), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+async def send_photo_reliable(thread_id: int, png: bytes, caption: str = "") -> Optional[int]:
+    if bot is None:
+        return None
+    import io
+    for attempt in range(1, TG_SEND_RETRIES + 1):
+        try:
+            bio = io.BytesIO(png)
+            bio.name = "zapato.png"
+            msg = await bot.send_photo(chat_id=CHAT_ID, photo=bio, caption=caption, message_thread_id=thread_id)
+            return msg.message_id
+        except Exception as e:
+            log.warning(f"[Telegram] Error enviando imagen (tema {thread_id}): {e}")
+            await asyncio.sleep(min(2 * attempt, 20))
+    return None
+
+def shoe_results(table: "BaccaratTable") -> list:
+    """Resultados P/B/T del zapato actual (se toma una copia en el momento de enviar)."""
+    return [h.get("r") for h in table.shoe_hands if h.get("r") in ("P", "B", "T")]
+
+def enqueue_photo(table: "BaccaratTable", thread_id: int, caption: str,
+                  results: Optional[list] = None, allow_empty: bool = False) -> dict:
+    """Envía la imagen del zapato con `caption` como pie de página. El mensaje queda en el chat (no se borra).
+    Sin Pillow (o con SHOE_IMAGE=0) se envía solo el texto."""
+    holder: dict = {}
+    results = list(shoe_results(table) if results is None else results)
+    label = table.label
+    use_img = SHOE_IMAGE and PIL_OK and (bool(results) or allow_empty)
+
+    async def job():
+        if use_img:
+            png = await asyncio.to_thread(render_shoe_png, label, results)
+            if png:
+                holder["id"] = await send_photo_reliable(thread_id, png, caption)
+                if holder["id"] is not None:
+                    return
+        holder["id"] = await send_reliable(thread_id, caption)
+
+    enqueue_job(job)
+    return holder
+
+
+# ══════════════════════════════════════════════
 #  FORMATO DE MENSAJES
 # ══════════════════════════════════════════════
 def keycap(n: int) -> str:
@@ -975,21 +1076,17 @@ def keycap(n: int) -> str:
     return "".join(d + "\ufe0f\u20e3" for d in str(n))
 
 def build_possible_message(label: str, k: int = 1, total: int = 2, strategy: int = 1, road: str = "big") -> str:
-    """POSIBLE ENTRADA 1️⃣ de 2️⃣ (confirmación k de total) + estrategia y gráfico (G1 círculo · G2 Big Eye Boy · G3 Small · G4 Cockroach)."""
+    """Pie de la posible señal (confirmación k de total) · E = estrategia · G = gráfico (G1 círculo · G2 Big Eye · G3 Small · G4 Cockroach):
+    🔔 E1/G2 -> P.E. 1️⃣ de 2️⃣ 🔔   (P.E. = posible entrada)"""
     rd = ROAD_DEFS.get(road, ROAD_DEFS["big"])
-    return (f"🚸 POSIBLE ENTRADA {keycap(k)} de {keycap(total)} 🚸\n"
-            f"- Mesa: {label} -> Estrategia {strategy}\n"
-            f"- Gráfico: {rd['name']} -> G{rd['num']}")
+    return f"🔔 E{strategy}/G{rd['num']} -> P.E. {keycap(k)} de {keycap(total)} 🔔"
 
 def side_label(side: str) -> str:
     return "Banker 🔴" if side == "B" else "Player 🔵"
 
 def build_attempt_message(label: str, sig: "Signal", att: dict) -> str:
-    """Mensaje de cada intento (mismo diseño en los 3): lado elegido por el análisis y monto de Labouchere."""
-    return ("✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
-            f"🕹️ Mesa: {label}\n"
-            f"🏁 Entrada: ${att['stake_amount']} a {side_label(att['bet_side'])}\n\n"
-            f"🔔 Intento {att['level']} de {MAX_ENTRIES} - Labouchere")
+    """Pie de la señal: 🏁 Entrada: $200 a Banker 🔴 1/3"""
+    return f"🏁 Entrada: ${att['stake_amount']} a {side_label(att['bet_side'])} {att['level']}/{MAX_ENTRIES}"
 
 def _strip_suit(label) -> str:
     return re.sub(r"[♠♥♦♣]", "", str(label)).strip()
@@ -1013,15 +1110,17 @@ def build_hands_line(hand: Optional[dict]) -> str:
             f"~ Banker = {'—' if bt is None else bt} 🔴{bn}")
 
 def build_result_message(kind: str, level: int, hand: Optional[dict], side: Optional[str]) -> str:
-    """UN solo mensaje: título + manos + resultado con el Win/Loss (los empates ya no se cuentan).
-    💹 ¡GANAMOS ENTRADA! 💹
-    ~ Player [2 + A + Q] = 3 🔵
-    ~ Banker [J + Q + Q] = 0 🔴
-    ~ Resultado Player 🔵 ~ Win 1 Exp."""
-    head = "💹 ¡GANAMOS ENTRADA! 💹" if kind == "win" else "💮 ¡PERDIMOS ENTRADA! 💮"
-    detail = f"Win {level} Exp." if kind == "win" else f"Loss {MAX_ENTRIES} Exp."
-    res = {"P": "Player 🔵", "B": "Banker 🔴", "T": "Tie 🟢"}.get(side or (hand or {}).get("r"), "—")
-    return f"{head}\n{build_hands_line(hand)}\n~ Resultado {res} ~ {detail}"
+    """Pie del resultado (puntajes 0-9, Player primero):
+    ✅ Resultado: 4 [🔵] v.s. 9 [🔴]   (ganada)
+    ❌ Resultado: 5 [🔵] v.s 4 [🔴]    (perdida)"""
+    h = hand or {}
+    c = h.get("cards") or {}
+    pt = c.get("player_total") if c.get("player_total") is not None else h.get("p")
+    bt = c.get("banker_total") if c.get("banker_total") is not None else h.get("b")
+    pt, bt = ("—" if pt is None else pt), ("—" if bt is None else bt)
+    if kind == "win":
+        return f"✅ Resultado: {pt} [🔵] v.s. {bt} [🔴]"
+    return f"❌ Resultado: {pt} [🔵] v.s {bt} [🔴]"
 
 def build_result_tag(kind: str, side: Optional[str]) -> str:
     """Texto que reemplaza al antiguo sticker de resultado."""
@@ -1473,7 +1572,7 @@ def enqueue_tracked_send(thread_id: int, text: str) -> dict:
 
 def enqueue_delete(holder: Optional[dict], thread_id: int = THREAD_SIGNALS):
     """Borra un mensaje enviado con enqueue_tracked_send (se encola después de su envío, así que el id ya existe)."""
-    if holder is None or holder.get("queued_delete"):
+    if KEEP_MESSAGES or holder is None or holder.get("queued_delete"):
         return
     holder["queued_delete"] = True
 
@@ -1500,26 +1599,36 @@ def notify_ml_training_report():
     enqueue_job(job)
 
 def notify_possible(table: "BaccaratTable", sig: "Signal"):
-    """POSIBLE ENTRADA: mensaje de texto (se borra cuando la señal se confirma o se descarta)."""
-    holder: dict = {}
+    """POSIBLE ENTRADA: imagen del zapato con el mensaje como pie. Queda en el chat.
+    Si en la misma ronda se había descartado otra señal, se envía este mensaje en lugar del de descarte."""
+    table.pending_discard = False
     text = build_possible_message(table.label, sig.attempt, sig.confirm_total, sig.strategy, (sig.analysis or {}).get("road", "big"))   # confirmación actual
-
-    async def job():
-        holder["id"] = await send_reliable(THREAD_SIGNALS, text)
-
-    enqueue_job(job)
-    sig.possible_holder = holder
+    sig.possible_holder = enqueue_photo(table, THREAD_SIGNALS, text)
 
 def delete_possible(sig: "Signal"):
-    enqueue_delete(sig.possible_holder)
+    enqueue_delete(sig.possible_holder)      # no hace nada mientras KEEP_MESSAGES esté activo
 
 def notify_discarded(table: "BaccaratTable", sig: "Signal"):
-    """Señal descartada (confirmación fallida, bloqueo o cambio de zapato): se borra la posible entrada."""
-    delete_possible(sig)
+    """Señal descartada (confirmación fallida, bloqueo o cambio de zapato): pie '♻ Posible señal descartada'.
+    El envío se aplaza al final del tick: si en esa misma ronda aparece otra posible señal, se manda esa y no el descarte."""
+    table.pending_discard = True
+    table.pending_discard_results = list(getattr(table, "shoe_snapshot", None) or shoe_results(table))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _flush_discard(table)
+        return
+    loop.call_soon(_flush_discard, table)
+
+def _flush_discard(table: "BaccaratTable"):
+    if getattr(table, "pending_discard", False):
+        table.pending_discard = False
+        enqueue_photo(table, THREAD_SIGNALS, "♻ Posible señal descartada",
+                      results=getattr(table, "pending_discard_results", None))
 
 def send_attempt(table: "BaccaratTable", sig: "Signal", att: dict) -> dict:
-    """Envía el mensaje del intento. El intento anterior lo borra quien llama (enqueue_delete) antes de enviar."""
-    return enqueue_tracked_send(THREAD_SIGNALS, build_attempt_message(table.label, sig, att))
+    """ENTRADA CONFIRMADA: imagen del zapato con el mensaje del intento como pie."""
+    return enqueue_photo(table, THREAD_SIGNALS, build_attempt_message(table.label, sig, att))
 
 def notify_result(table: "BaccaratTable", kind: str, level: int, side: Optional[str] = None, hand: Optional[dict] = None):
     """Resolución: UN mensaje en señales (manos + resultado + Win/Loss) → línea de resultado + marcador en estadísticas."""
@@ -1531,8 +1640,9 @@ def notify_result(table: "BaccaratTable", kind: str, level: int, side: Optional[
     stat_line = build_stat_line(kind, level)
     marker = STATS.marker_message()    # calculado ahora, para que el orden de la cola sea consistente
 
+    enqueue_photo(table, THREAD_SIGNALS, text)       # imagen del zapato + resultado como pie
+
     async def job():
-        await send_reliable(THREAD_SIGNALS, text)
         await send_reliable(THREAD_STATS, stat_line)
         await send_reliable(THREAD_STATS, marker)
 
@@ -1717,9 +1827,20 @@ class BaccaratTable:
 
     # ---- zapato ----
     def _reset_shoe(self):
+        prev = shoe_results(self)             # zapato que termina (para el pie del descarte)
+        self.shoe_snapshot = prev
         self.shoe_id += 1
         self.shoe_hands = []
         self.shoe_sides = []
+        try:
+            self._reset_shoe_signal()
+        finally:
+            self.shoe_snapshot = None
+        _flush_discard(self)                   # el descarte (si lo hubo) sale primero, con el zapato que terminó
+        if prev:                               # luego la imagen del zapato vacío
+            enqueue_photo(self, THREAD_SIGNALS, "🔄 Cambio de Zapato", results=[], allow_empty=True)
+
+    def _reset_shoe_signal(self):
         sig = self.signal
         if sig is not None and not sig.in_confirmation:
             # Entrada ya confirmada: NO se aborta. La señal sigue en el zapato nuevo (se resuelve y se notifica
@@ -1788,7 +1909,7 @@ class BaccaratTable:
             "alts": [f"{a['road']}|{a['pattern']}" for a in alts],
         }
 
-    def start_signal(self, det, live: bool):
+    def start_signal(self, det, live: bool, late: bool = False):
         target = det["target"]
         confirm = PATTERN_DEFS[det["pattern"]]["confirm"]
         alts = list(det.get("alts", []))
@@ -1807,9 +1928,38 @@ class BaccaratTable:
                  f"{det['road_name']} {det['pattern']} + confirmación {confirm} → {side_label(target)} "
                  f"({det['probability']*100:.1f}%, n={det['occurrences']})"
                  + (f" · alternativas: {', '.join(a['road'] + '|' + a['pattern'] for a in alts)}" if alts else ""))
+        if late:
+            # El patrón salió mientras otra señal estaba en curso, así que su "1 de 2" no se pudo enviar. La 1.ª marca de
+            # confirmación ya se cumplió: la señal arranca directamente en "2 de 2".
+            sg = self.signal
+            sg.confirmations.append({
+                "k": 1, "road": det.get("road"), "pattern": sg.key, "expected_symbol": confirm[0],
+                "keep_side": None, "expected_side": None, "mode": "late", "source": "patrón surgido durante otra señal",
+                "p_keep": None, "models": {}, "similar": det.get("similar_cases", 0), "n_rows": 0,
+                "features": {}, "candidate": det, "outcome": "confirmed", "late": True})
+            sg.attempt = 2
+            log.info(f"[{self.label}] ⏩ Señal tardía: {sg.key} surgió durante la señal anterior; arranca en 2 de {sg.confirm_total}")
         if live:
             notify_possible(self, self.signal)
         self._plan_confirmation(self.signal)
+
+    def detect_late_pattern(self):
+        """Patrón que se completó en la ronda ANTERIOR (mientras había otra señal en curso, por eso no se avisó su "1 de 2")
+        y cuya 1.ª marca de confirmación acaba de salir en esta ronda. Devuelve el candidato o None."""
+        if len(self.history_hands) < 2 or self.history_hands[-2].get("shoe_id") != self.shoe_id:
+            return None
+        if len(self.shoe_sides) < MIN_PATTERN_LEN + 1:
+            return None
+        data = analyze_road_candidates(self.history_hands[:-1], library=PATTERN_LIB)
+        data = [c for c in data if self._candidate_alive(c, 1)]
+        best_orig = choose_best_candidate(data) if data else None
+        if not best_orig:
+            return None
+        alts = [c for c in sorted(eligible_candidates(data), key=_cand_score, reverse=True) if c is not best_orig]
+        best = dict(best_orig)
+        best["all_candidates"] = sorted(data, key=lambda x: x["probability"], reverse=True)
+        best["alts"] = alts
+        return best
 
     # ---- confirmaciones: marcas fijas por patrón, medidas EN EL GRÁFICO donde salió el patrón ----
     def _candidate_alive(self, cand: dict, k: int, confirm: Optional[str] = None) -> bool:
@@ -2107,6 +2257,13 @@ class BaccaratTable:
         live = True
         if live and self._other_confirmed() is not None:
             return   # hay una entrada confirmada en otra mesa: no se envían señales hasta que se resuelva
+        if sig is not None and r != "T":
+            # Se acaba de resolver/cerrar una señal: un patrón que salió durante ella y ya confirmó su 1.ª marca se envía
+            # como "2 de 2" aunque no se haya podido enviar el "1 de 2".
+            late = self.detect_late_pattern()
+            if late:
+                self.start_signal(late, live, late=True)
+                return
         det = self.detect_pattern()
         if det:
             self.start_signal(det, live)
