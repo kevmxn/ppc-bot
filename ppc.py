@@ -1122,6 +1122,20 @@ def build_result_message(kind: str, level: int, hand: Optional[dict], side: Opti
         return f"✅ Resultado: {pt} [🔵] v.s. {bt} [🔴]"
     return f"❌ Resultado: {pt} [🔵] v.s {bt} [🔴]"
 
+def build_round_message(n: int, hand: Optional[dict]) -> str:
+    """Pie cuando la ronda no generó ningún otro mensaje (puntajes 0-9, Player primero):
+    💎 Ronda N° 23: 7 [🔵] v.s 5 [🔴]"""
+    h = hand or {}
+    c = h.get("cards") or {}
+    pt = c.get("player_total") if c.get("player_total") is not None else h.get("p")
+    bt = c.get("banker_total") if c.get("banker_total") is not None else h.get("b")
+    pt, bt = ("—" if pt is None else pt), ("—" if bt is None else bt)
+    return f"💎 Ronda N° {n}: {pt} [🔵] v.s {bt} [🔴]"
+
+def notify_round(table: "BaccaratTable", hand: Optional[dict]):
+    """Ronda sin señal/resultado/descarte: imagen del zapato con el resultado de la ronda como pie."""
+    enqueue_photo(table, THREAD_SIGNALS, build_round_message(len(table.shoe_hands), hand))
+
 def build_result_tag(kind: str, side: Optional[str]) -> str:
     """Texto que reemplaza al antiguo sticker de resultado."""
     if kind == "win":
@@ -1602,6 +1616,7 @@ def notify_possible(table: "BaccaratTable", sig: "Signal"):
     """POSIBLE ENTRADA: imagen del zapato con el mensaje como pie. Queda en el chat.
     Si en la misma ronda se había descartado otra señal, se envía este mensaje en lugar del de descarte."""
     table.pending_discard = False
+    table.round_msg_sent = True
     text = build_possible_message(table.label, sig.attempt, sig.confirm_total, sig.strategy, (sig.analysis or {}).get("road", "big"))   # confirmación actual
     sig.possible_holder = enqueue_photo(table, THREAD_SIGNALS, text)
 
@@ -1612,6 +1627,7 @@ def notify_discarded(table: "BaccaratTable", sig: "Signal"):
     """Señal descartada (confirmación fallida, bloqueo o cambio de zapato): pie '♻ Posible señal descartada'.
     El envío se aplaza al final del tick: si en esa misma ronda aparece otra posible señal, se manda esa y no el descarte."""
     table.pending_discard = True
+    table.round_msg_sent = True
     table.pending_discard_results = list(getattr(table, "shoe_snapshot", None) or shoe_results(table))
     try:
         loop = asyncio.get_running_loop()
@@ -1628,10 +1644,12 @@ def _flush_discard(table: "BaccaratTable"):
 
 def send_attempt(table: "BaccaratTable", sig: "Signal", att: dict) -> dict:
     """ENTRADA CONFIRMADA: imagen del zapato con el mensaje del intento como pie."""
+    table.round_msg_sent = True
     return enqueue_photo(table, THREAD_SIGNALS, build_attempt_message(table.label, sig, att))
 
 def notify_result(table: "BaccaratTable", kind: str, level: int, side: Optional[str] = None, hand: Optional[dict] = None):
     """Resolución: UN mensaje en señales (manos + resultado + Win/Loss) → línea de resultado + marcador en estadísticas."""
+    table.round_msg_sent = True
     STATS.record(kind, level)
     save_stats()
     if not ((hand or {}).get("cards") or {}).get("player_cards"):
@@ -1777,6 +1795,7 @@ class BaccaratTable:
         self.signal: Optional[Signal] = None
         self.connected = False
         self.hands = 0
+        self.round_msg_sent = False       # ¿ya salió algún pie (posible/entrada/resultado/descarte) en la ronda actual?
         self.peers: list = []             # todas las mesas (lo asigna ServerState) para el bloqueo entre mesas
 
     def restore_hands(self, hands: list):
@@ -2166,12 +2185,20 @@ class BaccaratTable:
 
     # ---- una mano ----
     def process_coup(self, r: str, seed: bool = False, hand: Optional[dict] = None):
+        """Procesa la mano y, si en esa ronda no salió ningún otro pie, envía el resultado de la ronda."""
+        self.round_msg_sent = False
+        self._process_coup_core(r, seed, hand)
+        if not seed and not self.round_msg_sent and self.shoe_hands:
+            notify_round(self, self.shoe_hands[-1])
+
+    def _process_coup_core(self, r: str, seed: bool = False, hand: Optional[dict] = None):
         if hand is None:
             hand = {"gid": None, "r": r, "p": None, "b": None, "raw": {}}
         self.hands += 1
         if len(self.shoe_hands) >= SHOE_MAX_HANDS:
             log.warning(f"[{self.label}] {len(self.shoe_hands)} manos sin aviso de barajado: se asume zapato nuevo")
             self._reset_shoe()
+            self.round_msg_sent = False   # descarte del zapato anterior ≠ pie de esta ronda
         hand = dict(hand)
         hand["shoe_id"] = self.shoe_id
         self.shoe_hands.append(hand)
