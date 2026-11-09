@@ -1077,9 +1077,9 @@ def keycap(n: int) -> str:
 
 def build_possible_message(label: str, k: int = 1, total: int = 2, strategy: int = 1, road: str = "big") -> str:
     """Pie de la posible señal (confirmación k de total) · E = estrategia · G = gráfico (G1 círculo · G2 Big Eye · G3 Small · G4 Cockroach):
-    🔔 E1/G2 -> P.E. 1️⃣ de 2️⃣ 🔔   (P.E. = posible entrada)"""
+    🔔 E4/G4/Confirmación 2️⃣ de 2️⃣ 🔔"""
     rd = ROAD_DEFS.get(road, ROAD_DEFS["big"])
-    return f"🔔 E{strategy}/G{rd['num']} -> P.E. {keycap(k)} de {keycap(total)} 🔔"
+    return f"🔔 E{strategy}/G{rd['num']}/Confirmación {keycap(k)} de {keycap(total)} 🔔"
 
 def side_label(side: str) -> str:
     return "Banker 🔴" if side == "B" else "Player 🔵"
