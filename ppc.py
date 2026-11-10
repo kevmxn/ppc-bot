@@ -112,6 +112,39 @@ RELIABLE_WINDOW     = int(os.environ.get("RELIABLE_WINDOW", "200"))        # úl
 RELIABLE_MIN_PRED   = int(os.environ.get("RELIABLE_MIN_PRED", "100"))      # predicciones mínimas evaluadas
 RELIABLE_MIN_ACC    = float(os.environ.get("RELIABLE_MIN_ACC", "0.56"))    # acierto mínimo de mantener/cambiar (azar = 0.50)
 
+# ── Cambio de zapato ──
+SHOE_RESET_DEBOUNCE = float(os.environ.get("SHOE_RESET_DEBOUNCE", "90"))   # s: avisos de barajado repetidos dentro de este tiempo se ignoran
+SHOE_RESET_GRACE    = float(os.environ.get("SHOE_RESET_GRACE", "15"))      # s: tras un aviso de cambio de zapato aún se acepta la última mano del zapato anterior (va al zapato que termina)
+SHOE_CHANGE_MSG     = os.environ.get("SHOE_CHANGE_MSG", "0") == "1"        # 0 = (por defecto) NO se envía el zapato limpio aparte: el zapato nuevo sale con la Ronda N° 1 · 1 = enviar además '🔄 Cambio de Zapato'
+
+# ── Filtro de entrada (más exigente) ──
+ENTRY_FILTER      = os.environ.get("ENTRY_FILTER", "1") == "1"              # 1 = exigir respaldo histórico y filtro EMA antes de enviar
+ENTRY_MIN_CASES   = int(os.environ.get("ENTRY_MIN_CASES", "8"))             # casos históricos del patrón (intento 1) para poder opinar
+ENTRY_P_BASE      = float(os.environ.get("ENTRY_P_BASE", "0.60"))           # probabilidad mínima del intento 1 (sube sola si no se cumple la meta)
+ENTRY_STRICT_STEP = float(os.environ.get("ENTRY_STRICT_STEP", "0.02"))      # cuánto sube la exigencia en cada nivel
+ENTRY_STRICT_MAX  = int(os.environ.get("ENTRY_STRICT_MAX", "6"))            # niveles máximos de exigencia
+TARGET_WIN1       = float(os.environ.get("TARGET_WIN1", "0.60"))            # meta: Win 1 ≈ 60%
+TARGET_WIN1_MAX   = float(os.environ.get("TARGET_WIN1_MAX", "0.65"))        # Win 1 entre 60% y 65%
+TARGET_WIN2_MIN   = float(os.environ.get("TARGET_WIN2_MIN", "0.25"))        # Win 2 entre 25% y 30%
+TARGET_WIN2_MAX   = float(os.environ.get("TARGET_WIN2_MAX", "0.30"))
+TARGET_WIN3_MIN   = float(os.environ.get("TARGET_WIN3_MIN", "0.08"))        # Win 3 entre 8% y 12%
+TARGET_WIN3_MAX   = float(os.environ.get("TARGET_WIN3_MAX", "0.12"))
+ATT2_STRICT_MAX   = int(os.environ.get("ATT2_STRICT_MAX", "4"))             # niveles máximos de exigencia del intento 2
+ATT2_MARGIN_STEP  = float(os.environ.get("ATT2_MARGIN_STEP", "0.02"))       # intento 2: ventaja mínima sobre 50% (sube por nivel) para cambiar de dirección
+ATT2_CASES_STEP   = int(os.environ.get("ATT2_CASES_STEP", "5"))             # intento 2: casos históricos extra exigidos por nivel
+TARGET_EFF_MIN    = float(os.environ.get("TARGET_EFF_MIN", "0.93"))         # meta: efectividad entre 93% y 95%
+TARGET_EFF_OK     = float(os.environ.get("TARGET_EFF_OK", "0.95"))
+ADAPT_WINDOW      = int(os.environ.get("ADAPT_WINDOW", "40"))               # últimas N señales resueltas que mide el control
+ADAPT_MIN         = int(os.environ.get("ADAPT_MIN", "15"))                  # señales mínimas para empezar a ajustar
+ADAPT_COOLDOWN    = int(os.environ.get("ADAPT_COOLDOWN", "5"))              # señales entre un ajuste y el siguiente
+# Gráfico de nivel (continuo entre zapatos): Player +1, Banker -1, Tie = igual que la última mano P/B. Filtro EMA 20/50/20.
+EMA_FILTER        = os.environ.get("EMA_FILTER", "1") == "1"
+EMA_FAST, EMA_SLOW, EMA_SIGNAL = 20, 50, 20
+EMA_MODE          = os.environ.get("EMA_MODE", "follow")                    # follow = apostar a favor del impulso · fade = en contra
+EMA3_FILTER       = os.environ.get("EMA3_FILTER", "1") == "1"               # 1 = segundo filtro: gráfico de nivel con EMAs 20/50/100 (debe estar a favor del lado)
+EMA3_PERIODS      = (20, 50, 100)
+EMA_REQUIRE_TREND = os.environ.get("EMA_REQUIRE_TREND", "0") == "1"         # 1 = además exigir EMA20 > EMA50 (Player) o EMA20 < EMA50 (Banker)
+
 # ── Validación de manos: cada lado debe traer 2 o 3 cartas legibles. Si no, se consulta de nuevo a la API ──
 HAND_RETRY_DELAY     = float(os.environ.get("HAND_RETRY_DELAY", "3"))        # segundos entre consultas
 HAND_RECONNECT_EVERY = int(os.environ.get("HAND_RECONNECT_EVERY", "4"))      # cada N consultas sin éxito se reconecta el WebSocket
@@ -909,7 +942,7 @@ def choose_best_candidate(candidates):
 def analysis_text(a):
     if not a:
         return "sin historial"
-    return (f"{a['road_name']} {a['pattern']} → {('Player' if a.get('bet_side', a['target'])=='P' else 'Banker')} · "
+    return (f"{a['road_name']} {a['pattern']} → {('Jugador' if a.get('bet_side', a['target'])=='P' else 'Banca')} · "
             f"{a['probability']*100:.1f}% · n={a['occurrences']} · "
             f"mismas cartas={a.get('exact_cases', 0)} · mínima variación={a.get('near_cases', 0)}")
 
@@ -1082,10 +1115,10 @@ def build_possible_message(label: str, k: int = 1, total: int = 2, strategy: int
     return f"🔔 E{strategy}/G{rd['num']}/Confirmación {keycap(k)} de {keycap(total)} 🔔"
 
 def side_label(side: str) -> str:
-    return "Banker 🔴" if side == "B" else "Player 🔵"
+    return "Banca 🔴" if side == "B" else "Jugador 🔵"
 
 def build_attempt_message(label: str, sig: "Signal", att: dict) -> str:
-    """Pie de la señal: 🏁 Entrada: $200 a Banker 🔴 1/3"""
+    """Pie de la señal: 🏁 Entrada: $200 a Banca 🔴 1/3"""
     return f"🏁 Entrada: ${att['stake_amount']} a {side_label(att['bet_side'])} {att['level']}/{MAX_ENTRIES}"
 
 def _strip_suit(label) -> str:
@@ -1099,15 +1132,15 @@ def _cards_txt(labels, values) -> str:
     return " + ".join(items) or "—"
 
 def build_hands_line(hand: Optional[dict]) -> str:
-    """Solo puntajes (0-9), sin cartas:  Player = 9 🔵 (Natural 9)\n Banker = 4 🔴"""
+    """Solo puntajes (0-9), sin cartas:  Jugador = 9 🔵 (Natural 9)\n Banca = 4 🔴"""
     h = hand or {}
     c = h.get("cards") or {}
     pt = c.get("player_total") if c.get("player_total") is not None else h.get("p")
     bt = c.get("banker_total") if c.get("banker_total") is not None else h.get("b")
     pn = f" · Natural {pt}" if c.get("player_natural") and pt is not None else ""
     bn = f" · Natural {bt}" if c.get("banker_natural") and bt is not None else ""
-    return (f"~ Player = {'—' if pt is None else pt} 🔵{pn}\n"
-            f"~ Banker = {'—' if bt is None else bt} 🔴{bn}")
+    return (f"~ Jugador = {'—' if pt is None else pt} 🔵{pn}\n"
+            f"~ Banca = {'—' if bt is None else bt} 🔴{bn}")
 
 def build_result_message(kind: str, level: int, hand: Optional[dict], side: Optional[str]) -> str:
     """Pie del resultado (puntajes 0-9, Player primero):
@@ -1132,6 +1165,14 @@ def build_round_message(n: int, hand: Optional[dict]) -> str:
     pt, bt = ("—" if pt is None else pt), ("—" if bt is None else bt)
     return f"💎 Ronda N° {n}: {pt} [🔵] v.s {bt} [🔴]"
 
+def round_header(table: "BaccaratTable") -> str:
+    """Primera fila de los pies de señal: '💎 Ronda N° 23: 7 [🔵] v.s 5 [🔴]' + salto de línea.
+    Solo cuando el mensaje sale por la mano que se está procesando en esta mesa; en un cambio de zapato
+    (zapato vacío) o en mensajes de otra mesa no se agrega."""
+    if getattr(table, "in_coup", False) and table.shoe_hands:
+        return build_round_message(len(table.shoe_hands), table.shoe_hands[-1]) + "\n"
+    return ""
+
 def notify_round(table: "BaccaratTable", hand: Optional[dict]):
     """Ronda sin señal/resultado/descarte: imagen del zapato con el resultado de la ronda como pie."""
     enqueue_photo(table, THREAD_SIGNALS, build_round_message(len(table.shoe_hands), hand))
@@ -1139,13 +1180,31 @@ def notify_round(table: "BaccaratTable", hand: Optional[dict]):
 def build_result_tag(kind: str, side: Optional[str]) -> str:
     """Texto que reemplaza al antiguo sticker de resultado."""
     if kind == "win":
-        return "🏆 GANADA con Banker 🔴" if side == "B" else "🏆 GANADA con Player 🔵"
+        return "🏆 GANADA con Banca 🔴" if side == "B" else "🏆 GANADA con Jugador 🔵"
     return "❌ SEÑAL PERDIDA"
 
-def build_stat_line(kind: str, level: int) -> str:
+def money(v) -> str:
+    """+$1,200 / -$600 / $0"""
+    v = int(round(v))
+    return "$0" if v == 0 else f"{'+' if v > 0 else '-'}${abs(v):,}"
+
+def signal_profit(sig: "Signal") -> int:
+    """Ganancia neta de una señal: cada intento perdido resta su monto, el ganado suma su monto
+    (Banca sin comisión gana solo la mitad con 6) y los empates no suman ni restan."""
+    total = 0.0
+    for att in sig.attempts:
+        amount = att.get("stake_amount") or 0
+        if att.get("outcome") == "win":
+            total += amount * (0.5 if att.get("half_win") else 1.0)
+        elif att.get("outcome") == "loss":
+            total -= amount
+    return int(round(total))
+
+def build_stat_line(kind: str, level: int, profit: Optional[int] = None) -> str:
+    extra = "" if profit is None else f" · {money(profit)}"
     if kind == "win":
-        return f"💹 Win {level} Exp."
-    return f"💮 Loss {MAX_ENTRIES} Exp."
+        return f"💹 Win {level} Exp.{extra}"
+    return f"💮 Loss {MAX_ENTRIES} Exp.{extra}"
 
 
 # ══════════════════════════════════════════════
@@ -1155,16 +1214,65 @@ class GlobalStats:
     def __init__(self):
         self.wins = [0] * MAX_ENTRIES   # Win 1, Win 2, Win 3
         self.losses = 0                 # los empates NO se cuentan
+        self.recent: list = []          # últimas señales resueltas: nivel del Win (1-3) o 0 = Loss
+        self.strict = 0                 # nivel de exigencia del filtro de entrada (se ajusta solo)
+        self.strict_at = 0              # total de señales cuando se ajustó por última vez
+        self.strict2 = 0                # nivel de exigencia del intento 2 (se ajusta solo)
+        self.profit = 0                 # ganancia neta acumulada (solo señales reales; los empates no suman ni restan)
 
     @property
     def total(self) -> int:
         return sum(self.wins) + self.losses
 
-    def record(self, kind: str, level: int):
+    def record(self, kind: str, level: int, profit: int = 0):
+        self.profit += profit
         if kind == "win":
             self.wins[level - 1] += 1
+            self.recent.append(level)
         elif kind == "loss":
             self.losses += 1
+            self.recent.append(0)
+        del self.recent[:-ADAPT_WINDOW]
+
+    def entry_p(self) -> float:
+        """Probabilidad mínima exigida al intento 1 con el nivel de exigencia actual."""
+        return min(0.80, ENTRY_P_BASE + ENTRY_STRICT_STEP * self.strict)
+
+    def att2_margin(self) -> float:
+        """Intento 2: ventaja mínima sobre 50% que exige el historial para cambiar de dirección."""
+        return ML_MARGIN + ATT2_MARGIN_STEP * self.strict2
+
+    def att2_cases(self) -> int:
+        """Intento 2: casos históricos mínimos para que el historial opine."""
+        return ML_CTX_MIN + ATT2_CASES_STEP * self.strict2
+
+    def adapt(self):
+        """Control de calidad por intento sobre las últimas señales resueltas. Metas: Win 1 60–65% · Win 2 25–30% ·
+        Win 3 8–12% · efectividad global 93–95%.
+        · Intento 1 (exigencia `strict`): sube si Win 1 < 60%, la efectividad < 93% o Win 3 > 12%; baja si Win 1 ≥ 65% y la efectividad ≥ 95%.
+        · Intento 2 (exigencia `strict2`): sube si Win 2 < 25% o Win 3 > 12%; baja si Win 2 ≥ 25%, Win 3 ≤ 8% y la efectividad ≥ 95%.
+        Con exigencia alta salen menos señales pero más selectivas (se relaja sola cuando las metas se cumplen con holgura)."""
+        n = len(self.recent)
+        if n < ADAPT_MIN or self.total - self.strict_at < ADAPT_COOLDOWN:
+            return
+        w1 = self.recent.count(1) / n
+        w2 = self.recent.count(2) / n
+        w3 = self.recent.count(3) / n
+        eff = 1 - self.recent.count(0) / n
+        old1, old2 = self.strict, self.strict2
+        if w1 < TARGET_WIN1 or eff < TARGET_EFF_MIN or w3 > TARGET_WIN3_MAX:
+            self.strict = min(ENTRY_STRICT_MAX, self.strict + 1)
+        elif w1 >= TARGET_WIN1_MAX and eff >= TARGET_EFF_OK:
+            self.strict = max(0, self.strict - 1)
+        if w2 < TARGET_WIN2_MIN or w3 > TARGET_WIN3_MAX:
+            self.strict2 = min(ATT2_STRICT_MAX, self.strict2 + 1)
+        elif w2 >= TARGET_WIN2_MIN and w3 <= TARGET_WIN3_MIN and eff >= TARGET_EFF_OK:
+            self.strict2 = max(0, self.strict2 - 1)
+        if (self.strict, self.strict2) != (old1, old2):
+            self.strict_at = self.total
+            log.info(f"🎚 Control por intento (últimas {n}): Win1 {w1*100:.0f}% · Win2 {w2*100:.0f}% · Win3 {w3*100:.0f}% · "
+                     f"efectividad {eff*100:.0f}% → intento 1: exigencia {old1}→{self.strict} (mín. {self.entry_p()*100:.0f}%) · "
+                     f"intento 2: exigencia {old2}→{self.strict2} (ventaja ≥{self.att2_margin()*100:.0f}%, ≥{self.att2_cases()} casos)")
 
     def _pct(self, n: int) -> str:
         t = self.total
@@ -1178,10 +1286,13 @@ class GlobalStats:
         lines.append("")
         lines.append(f"🎯 Total de Señales = ({self.total})")
         lines.append(f"📈 Efectividad Global = {self._pct(sum(self.wins))}")
+        lines.append(f"💰 Ganancia Neta = {money(self.profit)}")
         return "\n".join(lines)
 
     def to_persist(self):
-        return {"wins": self.wins, "losses": self.losses}
+        return {"wins": self.wins, "losses": self.losses, "recent": self.recent,
+                "strict": self.strict, "strict_at": self.strict_at, "strict2": self.strict2,
+                "profit": self.profit}
 
     def load_persist(self, data):
         if not isinstance(data, dict):
@@ -1190,6 +1301,16 @@ class GlobalStats:
         if isinstance(wins, list) and len(wins) == MAX_ENTRIES:
             self.wins = [int(x) for x in wins]
         self.losses = int(data.get("losses", 0))   # "ties" de archivos viejos se ignora
+        rec = data.get("recent")
+        if isinstance(rec, list):
+            self.recent = [int(x) for x in rec if str(x).lstrip("-").isdigit()][-ADAPT_WINDOW:]
+        self.strict = max(0, min(ENTRY_STRICT_MAX, int(data.get("strict", 0) or 0)))
+        self.strict_at = int(data.get("strict_at", 0) or 0)
+        self.strict2 = max(0, min(ATT2_STRICT_MAX, int(data.get("strict2", 0) or 0)))
+        try:
+            self.profit = int(round(float(data.get("profit", 0) or 0)))
+        except (TypeError, ValueError):
+            self.profit = 0
 
 STATS = GlobalStats()
 
@@ -1301,6 +1422,7 @@ def build_signal_record(table: "BaccaratTable", sig: "Signal", result: str, reas
         "win_level": win_att["level"] if win_att else None,
         "win_hand": win_att["hand"] if win_att else None,
         "labouchere_final": list(LAB.seq),
+        "entry_filter": sig.entry_filter,
     }
 
 def append_signal_log(record: dict):
@@ -1617,7 +1739,7 @@ def notify_possible(table: "BaccaratTable", sig: "Signal"):
     Si en la misma ronda se había descartado otra señal, se envía este mensaje en lugar del de descarte."""
     table.pending_discard = False
     table.round_msg_sent = True
-    text = build_possible_message(table.label, sig.attempt, sig.confirm_total, sig.strategy, (sig.analysis or {}).get("road", "big"))   # confirmación actual
+    text = round_header(table) + build_possible_message(table.label, sig.attempt, sig.confirm_total, sig.strategy, (sig.analysis or {}).get("road", "big"))   # confirmación actual
     sig.possible_holder = enqueue_photo(table, THREAD_SIGNALS, text)
 
 def delete_possible(sig: "Signal"):
@@ -1628,6 +1750,7 @@ def notify_discarded(table: "BaccaratTable", sig: "Signal"):
     El envío se aplaza al final del tick: si en esa misma ronda aparece otra posible señal, se manda esa y no el descarte."""
     table.pending_discard = True
     table.round_msg_sent = True
+    table.pending_discard_text = round_header(table) + "♻ Se Descartó Posible Señal ♻"
     table.pending_discard_results = list(getattr(table, "shoe_snapshot", None) or shoe_results(table))
     try:
         loop = asyncio.get_running_loop()
@@ -1639,23 +1762,25 @@ def notify_discarded(table: "BaccaratTable", sig: "Signal"):
 def _flush_discard(table: "BaccaratTable"):
     if getattr(table, "pending_discard", False):
         table.pending_discard = False
-        enqueue_photo(table, THREAD_SIGNALS, "♻ Posible señal descartada",
+        enqueue_photo(table, THREAD_SIGNALS, getattr(table, "pending_discard_text", None) or "♻ Se Descartó Posible Señal ♻",
                       results=getattr(table, "pending_discard_results", None))
 
 def send_attempt(table: "BaccaratTable", sig: "Signal", att: dict) -> dict:
     """ENTRADA CONFIRMADA: imagen del zapato con el mensaje del intento como pie."""
     table.round_msg_sent = True
-    return enqueue_photo(table, THREAD_SIGNALS, build_attempt_message(table.label, sig, att))
+    return enqueue_photo(table, THREAD_SIGNALS, round_header(table) + build_attempt_message(table.label, sig, att))
 
-def notify_result(table: "BaccaratTable", kind: str, level: int, side: Optional[str] = None, hand: Optional[dict] = None):
+def notify_result(table: "BaccaratTable", kind: str, level: int, side: Optional[str] = None, hand: Optional[dict] = None,
+                  profit: int = 0):
     """Resolución: UN mensaje en señales (manos + resultado + Win/Loss) → línea de resultado + marcador en estadísticas."""
     table.round_msg_sent = True
-    STATS.record(kind, level)
+    STATS.record(kind, level, profit)
+    STATS.adapt()
     save_stats()
     if not ((hand or {}).get("cards") or {}).get("player_cards"):
         log.warning(f"[{table.label}] Resultado sin cartas legibles: el mensaje saldrá con '—' en las manos")
     text = build_result_message(kind, level, hand, side)
-    stat_line = build_stat_line(kind, level)
+    stat_line = build_stat_line(kind, level, profit)
     marker = STATS.marker_message()    # calculado ahora, para que el orden de la cola sea consistente
 
     enqueue_photo(table, THREAD_SIGNALS, text)       # imagen del zapato + resultado como pie
@@ -1670,6 +1795,125 @@ def notify_result(table: "BaccaratTable", kind: str, level: int, side: Optional[
 # ══════════════════════════════════════════════
 #  MESA DE BACCARAT (lógica de processCoup/handleMsg del HTML)
 # ══════════════════════════════════════════════
+class LevelEMA:
+    """Gráfico de nivel CONTINUO entre zapatos: Player sube +1 (+1, +2, +3…), Banker baja -1 (-1, -2, -3…).
+    Un Tie se cuenta como la última mano P/B anterior (si fue Banker baja -1; si fue Player sube +1).
+    Filtro EMA 20/50/20 sobre ese nivel (estilo MACD): EMA20, EMA50, MACD = EMA20 − EMA50 y señal = EMA20 del MACD."""
+    def __init__(self, fast=EMA_FAST, slow=EMA_SLOW, sig=EMA_SIGNAL):
+        self.k = (2.0 / (fast + 1), 2.0 / (slow + 1), 2.0 / (sig + 1))
+        self.slow = slow
+        self.level = 0
+        self.last: Optional[str] = None
+        self.n = 0
+        self.e_fast = self.e_slow = self.e_sig = None
+        self.macd = 0.0
+
+    def update(self, r):
+        if r == "P":
+            step, self.last = 1, "P"
+        elif r == "B":
+            step, self.last = -1, "B"
+        elif r == "T":
+            step = 1 if self.last == "P" else (-1 if self.last == "B" else 0)
+            if step == 0:
+                return
+        else:
+            return
+        self.level += step
+        self.n += 1
+        x = float(self.level)
+        kf, ks, kg = self.k
+        self.e_fast = x if self.e_fast is None else self.e_fast + kf * (x - self.e_fast)
+        self.e_slow = x if self.e_slow is None else self.e_slow + ks * (x - self.e_slow)
+        self.macd = self.e_fast - self.e_slow
+        self.e_sig = self.macd if self.e_sig is None else self.e_sig + kg * (self.macd - self.e_sig)
+
+    @property
+    def ready(self) -> bool:
+        return self.n >= self.slow
+
+    @property
+    def hist(self) -> float:
+        return self.macd - (self.e_sig if self.e_sig is not None else self.macd)
+
+    def allows(self, side: str) -> bool:
+        """¿El filtro deja apostar a este lado ('P'/'B')? Sin datos suficientes no bloquea."""
+        if not self.ready:
+            return True
+        up = self.hist >= 0 if side == "P" else self.hist <= 0
+        if EMA_REQUIRE_TREND:
+            up = up and (self.macd >= 0 if side == "P" else self.macd <= 0)
+        if EMA_MODE == "fade":
+            down = self.hist <= 0 if side == "P" else self.hist >= 0
+            return down
+        return up
+
+    def snapshot(self) -> dict:
+        r = lambda v: None if v is None else round(v, 3)
+        return {"level": self.level, "ema20": r(self.e_fast), "ema50": r(self.e_slow), "macd": r(self.macd),
+                "signal": r(self.e_sig), "hist": r(self.hist), "n": self.n, "ready": self.ready}
+
+
+class LevelEMA3:
+    """Gráfico de nivel con EMAs 20/50/100 (continuo entre zapatos). Mismo manejo del nivel que LevelEMA:
+    Jugador sube +1 en cada ronda (+1, +2, +3…), Banca baja -1 (-1, -2, -3…) y en TODOS los empates se repite el
+    movimiento de la última ronda de Jugador/Banca (si fue Banca baja un nivel, si fue Jugador sube un nivel).
+    Tendencia alcista = EMA20 > EMA50 > EMA100 (favorece Jugador) · bajista = EMA20 < EMA50 < EMA100 (favorece Banca)."""
+    def __init__(self, periods=EMA3_PERIODS):
+        self.periods = tuple(periods)
+        self.k = [2.0 / (n + 1) for n in self.periods]
+        self.level = 0
+        self.last: Optional[str] = None
+        self.n = 0
+        self.e = [None] * len(self.periods)
+
+    def update(self, r):
+        if r == "P":
+            step, self.last = 1, "P"
+        elif r == "B":
+            step, self.last = -1, "B"
+        elif r == "T":
+            step = 1 if self.last == "P" else (-1 if self.last == "B" else 0)
+            if step == 0:
+                return                       # empate antes de cualquier Jugador/Banca: aún no hay nivel que seguir
+        else:
+            return
+        self.level += step
+        self.n += 1
+        x = float(self.level)
+        for i, k in enumerate(self.k):
+            self.e[i] = x if self.e[i] is None else self.e[i] + k * (x - self.e[i])
+
+    @property
+    def ready(self) -> bool:
+        return self.n >= self.periods[-1]
+
+    def trend(self) -> Optional[str]:
+        """'P' = EMA20 > EMA50 > EMA100 · 'B' = EMA20 < EMA50 < EMA100 · None = EMAs cruzadas (sin tendencia)."""
+        a, b, c = self.e
+        if a is None or c is None:
+            return None
+        if a > b > c:
+            return "P"
+        if a < b < c:
+            return "B"
+        return None
+
+    def allows(self, side: str) -> bool:
+        """¿El filtro deja apostar a este lado ('P'/'B')? Sin datos suficientes (menos de 100 rondas) no bloquea."""
+        if not self.ready:
+            return True
+        t = self.trend()
+        if t is None:
+            return False
+        return (t != side) if EMA_MODE == "fade" else (t == side)
+
+    def snapshot(self) -> dict:
+        r = lambda v: None if v is None else round(v, 3)
+        return {"level": self.level, "ema20": r(self.e[0]), "ema50": r(self.e[1]), "ema100": r(self.e[2]),
+                "trend": self.trend(), "n": self.n, "ready": self.ready}
+
+
 @dataclass
 class Signal:
     key: str
@@ -1702,6 +1946,7 @@ class Signal:
     confirm: str = ""                        # marcas de confirmación que exige el patrón, p. ej. "PB"
     alts: list = field(default_factory=list)   # otros patrones que se cumplieron a la vez (p. ej. PBBP dentro de BPBBP)
     switched_from: Optional[str] = None      # patrón con el que empezó la señal si se cambió a una alternativa
+    entry_filter: dict = field(default_factory=dict)   # estado del filtro EMA / exigencia cuando se decidió la entrada
 
     @property
     def in_confirmation(self) -> bool:
@@ -1795,6 +2040,13 @@ class BaccaratTable:
         self.signal: Optional[Signal] = None
         self.connected = False
         self.hands = 0
+        self.shoe_reset_pending = False   # aviso de barajado recibido: el zapato se cierra cuando terminen las manos del anterior
+        self.shoe_reset_old: set = set()  # manos (gid) que pertenecen al zapato que termina
+        self.shoe_reset_after = 0.0       # fin de la ventana de gracia del aviso 'shuffle'
+        self.last_reset_ts = 0.0
+        self.ema = LevelEMA()             # gráfico de nivel + EMA 20/50/20 (continuo entre zapatos)
+        self.ema3 = LevelEMA3()           # gráfico de nivel + EMAs 20/50/100 (continuo entre zapatos)
+        self.in_coup = False              # True mientras se procesa la mano de ESTA mesa (para el encabezado de ronda)
         self.round_msg_sent = False       # ¿ya salió algún pie (posible/entrada/resultado/descarte) en la ronda actual?
         self.peers: list = []             # todas las mesas (lo asigna ServerState) para el bloqueo entre mesas
 
@@ -1807,6 +2059,8 @@ class BaccaratTable:
         for h in hands:
             if h.get("gid") is not None:
                 self.seen.add(h["gid"])
+            self.ema.update(h.get("r"))      # el gráfico de nivel continúa entre zapatos y reinicios
+            self.ema3.update(h.get("r"))
         lib_scan_hands(self.key, hands)   # completa la biblioteca con las manos recuperadas
         LEARNED["hands"] += len(hands)
         LEARNED["restored"] += len(hands)
@@ -1845,7 +2099,36 @@ class BaccaratTable:
                 t._abort(f"bloqueada por entrada confirmada en {self.label}")
 
     # ---- zapato ----
+    def _request_shoe_reset(self, grace: float = 0.0):
+        """Aviso de barajado: NO se cierra el zapato al instante. Primero se procesan las manos del zapato anterior que aún
+        estén en cola (p. ej. esperando cartas correctas) y recién después se limpia el zapato; así la última ronda queda en
+        el zapato que termina y la primera mano nueva es la ronda N° 1 del zapato nuevo."""
+        now = time.time()
+        if self.shoe_reset_pending:
+            return
+        if now - self.last_reset_ts < SHOE_RESET_DEBOUNCE:
+            return                                    # aviso repetido del mismo barajado
+        if not self.shoe_hands and not self.hand_queue:
+            return                                    # no hay nada que cerrar
+        self.shoe_reset_pending = True
+        self.shoe_reset_old = set(self.seen) | {g for g, _, _ in self.hand_queue}
+        self.shoe_reset_after = now + grace
+        log.info(f"[{self.label}] 🔄 Aviso de barajado: se cierra el zapato al terminar las manos pendientes del anterior")
+        self._apply_pending_reset()
+
+    def _apply_pending_reset(self):
+        if not self.shoe_reset_pending:
+            return
+        if time.time() < self.shoe_reset_after:
+            return                                    # ventana de gracia: aún puede llegar la última mano del zapato anterior
+        if any(g in self.shoe_reset_old for g, _, _ in self.hand_queue):
+            return                                    # quedan manos del zapato anterior por procesar
+        self._reset_shoe()
+
     def _reset_shoe(self):
+        self.shoe_reset_pending = False
+        self.shoe_reset_old = set()
+        self.last_reset_ts = time.time()
         prev = shoe_results(self)             # zapato que termina (para el pie del descarte)
         self.shoe_snapshot = prev
         self.shoe_id += 1
@@ -1856,7 +2139,7 @@ class BaccaratTable:
         finally:
             self.shoe_snapshot = None
         _flush_discard(self)                   # el descarte (si lo hubo) sale primero, con el zapato que terminó
-        if prev:                               # luego la imagen del zapato vacío
+        if prev and SHOE_CHANGE_MSG:           # luego la imagen del zapato vacío (una sola vez por cambio de zapato)
             enqueue_photo(self, THREAD_SIGNALS, "🔄 Cambio de Zapato", results=[], allow_empty=True)
 
     def _reset_shoe_signal(self):
@@ -1875,12 +2158,78 @@ class BaccaratTable:
         st = data.get("baccaratShoeSummary")
         total = to_num(st.get("totalGames")) if isinstance(st, dict) else None
         if data.get("shuffle") is True:
-            self._reset_shoe()
             self.last_shoe_total = total
+            self._request_shoe_reset(SHOE_RESET_GRACE)
         elif total is not None:
-            if self.last_shoe_total is not None and total < self.last_shoe_total:
-                self._reset_shoe()
+            dropped = self.last_shoe_total is not None and total < self.last_shoe_total
             self.last_shoe_total = total
+            if dropped:
+                self._request_shoe_reset(SHOE_RESET_GRACE)
+
+    # ---- filtro de entrada (más exigente) ----
+    def _stat_gate(self, cand: dict):
+        """Intento 1: ¿el historial de ESTE patrón en ESTE gráfico respalda la entrada? Devuelve (ok, p, n).
+        p = probabilidad (suavizada) de que el intento 1 acierte, n = casos históricos. Debe superar la exigencia actual."""
+        if not ENTRY_FILTER:
+            return True, None, 0
+        h, n = lib_next_stats(cand["road"], cand["pattern"], "")
+        if n < ENTRY_MIN_CASES:
+            return False, None, n
+        p = (h + 1.0) / (n + 2.0)
+        trusted = ML.reliable() or not DIRECTION_REQUIRE_RELIABLE
+        if trusted and n >= ML_CTX_MIN and abs(p - 0.5) >= ML_MARGIN and p < 0.5:
+            p = 1.0 - p                               # el modelo apostaría al lado contrario: esa es su probabilidad
+        return p >= STATS.entry_p(), p, n
+
+    def _gate_candidates(self, data: list) -> list:
+        if not ENTRY_FILTER:
+            return data
+        ok_list = []
+        for c in data:
+            ok, p, n = self._stat_gate(c)
+            c["gate_p"], c["gate_n"] = p, n
+            if ok:
+                ok_list.append(c)
+        if data and not ok_list:
+            def _txt(c):
+                gp = c.get("gate_p")
+                return f"{c['road']}|{c['pattern']} p={'—' if gp is None else f'{gp*100:.0f}%'} n={c['gate_n']}"
+            log.info(f"[{getattr(self, 'label', '?')}] 🚫 Filtro: {len(data)} patrón(es) sin respaldo suficiente "
+                     f"(mín. {STATS.entry_p()*100:.0f}% con ≥{ENTRY_MIN_CASES} casos) · " + ", ".join(_txt(c) for c in data))
+        return ok_list
+
+    def _entry_veto(self, sig: Signal) -> Optional[str]:
+        """Última revisión antes de enviar el intento 1: el filtro EMA 20/50/20 del gráfico de nivel debe estar a favor del lado."""
+        if not (ENTRY_FILTER or EMA_FILTER or EMA3_FILTER):
+            return None
+        dec = self._decision_for_signal(sig, 1, 1)
+        if dec is None:
+            return None                               # lo resuelve _start_attempt
+        side = dec["expected_side"]
+        info = self.ema.snapshot()
+        info.update({"side": side, "mode": EMA_MODE, "strict": STATS.strict, "min_p": round(STATS.entry_p(), 3),
+                     "gate_p": (sig.analysis or {}).get("gate_p"), "gate_n": (sig.analysis or {}).get("gate_n")})
+        ok = (not EMA_FILTER) or self.ema.allows(side)
+        info["ema_ok"] = ok
+        info["ema3"] = self.ema3.snapshot()
+        ok3 = (not EMA3_FILTER) or self.ema3.allows(side)
+        info["ema3_ok"] = ok3
+        sig.entry_filter = info
+        if not ok:
+            return (f"filtro EMA 20/50/20 en contra de {side_label(side)} (nivel {info['level']:+d} · EMA20 {info['ema20']} · "
+                    f"EMA50 {info['ema50']} · MACD {info['macd']} · señal {info['signal']})")
+        if not ok3:
+            e3 = info["ema3"]
+            tr = {"P": "alcista", "B": "bajista"}.get(e3["trend"], "sin tendencia (EMAs cruzadas)")
+            return (f"filtro EMA 20/50/100 en contra de {side_label(side)}: {tr} (nivel {e3['level']:+d} · EMA20 {e3['ema20']} · "
+                    f"EMA50 {e3['ema50']} · EMA100 {e3['ema100']})")
+        return None
+
+    def _veto_entry(self, sig: Signal, reason: str):
+        if sig.live:
+            notify_discarded(self, sig)
+        append_signal_log(build_signal_record(self, sig, "discarded", reason))
+        self.signal = None
 
     # ---- nueva estrategia de 4 roads ----
     def detect_pattern(self):
@@ -1900,10 +2249,11 @@ class BaccaratTable:
             log.info(f"[{getattr(self, 'label', '?')}] Patrón {_c['pattern']} en {_c['road_name']} → rondas: {rondas} · "
                      f"previas={_c['occurrences']} · mismas cartas={_c['exact_cases']} · "
                      f"mínima variación={_c['near_cases']} · aciertos={_c['similar_wins']}/{_c['similar_cases']}")
-        best_orig = choose_best_candidate(data)
+        pool = self._gate_candidates(data)        # filtro de entrada: solo patrones con respaldo histórico suficiente
+        best_orig = choose_best_candidate(pool)
         if not best_orig:
             return None
-        alts = [c for c in sorted(eligible_candidates(data), key=_cand_score, reverse=True) if c is not best_orig]
+        alts = [c for c in sorted(eligible_candidates(pool), key=_cand_score, reverse=True) if c is not best_orig]
         best = dict(best_orig)   # copia: si no, all_candidates se contiene a sí mismo (referencia circular → json falla)
         best["all_candidates"] = sorted(data, key=lambda x: x["probability"], reverse=True)
         best["alts"] = alts
@@ -1971,10 +2321,11 @@ class BaccaratTable:
             return None
         data = analyze_road_candidates(self.history_hands[:-1], library=PATTERN_LIB)
         data = [c for c in data if self._candidate_alive(c, 1)]
-        best_orig = choose_best_candidate(data) if data else None
+        pool = self._gate_candidates(data) if data else []
+        best_orig = choose_best_candidate(pool) if pool else None
         if not best_orig:
             return None
-        alts = [c for c in sorted(eligible_candidates(data), key=_cand_score, reverse=True) if c is not best_orig]
+        alts = [c for c in sorted(eligible_candidates(pool), key=_cand_score, reverse=True) if c is not best_orig]
         best = dict(best_orig)
         best["all_candidates"] = sorted(data, key=lambda x: x["probability"], reverse=True)
         best["alts"] = alts
@@ -2036,11 +2387,22 @@ class BaccaratTable:
                         prev = None
                 if prev is not None:
                     lib_h, lib_n = lib_next_stats(road, sig.key, prev)
-            p_lib = (lib_h + 1.0) / (lib_n + 2.0) if lib_n >= ML_CTX_MIN else None
+            att2 = (level == 2)       # el intento 2 tiene su propia exigencia (se ajusta sola según Win 2 / Win 3)
+            min_cases = STATS.att2_cases() if att2 else ML_CTX_MIN
+            margin = STATS.att2_margin() if att2 else ML_MARGIN
+            p_lib = (lib_h + 1.0) / (lib_n + 2.0) if lib_n >= min_cases else None
             trusted = ML.reliable() or not DIRECTION_REQUIRE_RELIABLE
-            use_ml = trusted and p_lib is not None and abs(p_lib - 0.5) >= ML_MARGIN
+            use_ml = trusted and p_lib is not None and abs(p_lib - 0.5) >= margin
             expected = keep if not use_ml else (keep if p_lib > 0.5 else other_side(keep))
             source = "historial del patrón" if use_ml else ("patrón (entrenando)" if not ML.reliable() else "patrón")
+            if att2 and not use_ml and STATS.strict2 >= 1 and EMA3_FILTER and self.ema3.ready:
+                # historial no concluyente en el intento 2 con exigencia activa: desempata la tendencia EMA 20/50/100
+                tr = self.ema3.trend()
+                if tr in ("P", "B"):
+                    ema_side = other_side(tr) if EMA_MODE == "fade" else tr
+                    if ema_side != expected:
+                        expected = ema_side
+                        source += " · EMA 20/50/100"
             if prev_tie:
                 source += " · tras Tie"
             last = (self.shoe_hands[-1].get("cards") or {}) if self.shoe_hands else {}
@@ -2170,7 +2532,7 @@ class BaccaratTable:
             log.info("🔔 Cambio de estado del bot → " + ML.readiness_text().replace("\n", " "))
         if sig.live:
             hand = (sig.attempts[-1].get("hand") or {}) if sig.attempts else {}
-            notify_result(self, kind, level, hand.get("r"), hand)
+            notify_result(self, kind, level, hand.get("r"), hand, signal_profit(sig))
 
     def _abort(self, reason: str):
         """Señal que termina sin resultado (confirmación fallida, bloqueo, cambio de zapato)."""
@@ -2187,7 +2549,11 @@ class BaccaratTable:
     def process_coup(self, r: str, seed: bool = False, hand: Optional[dict] = None):
         """Procesa la mano y, si en esa ronda no salió ningún otro pie, envía el resultado de la ronda."""
         self.round_msg_sent = False
-        self._process_coup_core(r, seed, hand)
+        self.in_coup = True
+        try:
+            self._process_coup_core(r, seed, hand)
+        finally:
+            self.in_coup = False
         if not seed and not self.round_msg_sent and self.shoe_hands:
             notify_round(self, self.shoe_hands[-1])
 
@@ -2203,6 +2569,8 @@ class BaccaratTable:
         hand["shoe_id"] = self.shoe_id
         self.shoe_hands.append(hand)
         self.history_hands.append(hand)
+        self.ema.update(r)
+        self.ema3.update(r)
         if len(self.history_hands) > HANDS_KEEP:
             self.history_hands.pop(0)
         LEARNED["hands"] += 1
@@ -2270,12 +2638,17 @@ class BaccaratTable:
                             if sig.live and self.signal is sig:
                                 delete_possible(sig)      # reemplaza "1 de 2" por "2 de 2"
                                 notify_possible(self, sig)
-                        else:
+                            return
+                        veto = self._entry_veto(sig)      # filtro EMA 20/50/20 antes de enviar el intento 1
+                        if veto is None:
                             log.info(f"[{self.label}] ✅ Señal confirmada ({sig.key}) → analizando intento 1")
                             self._begin_entry(sig)
-                        return
-                    log.info(f"[{self.label}] Señal descartada (confirmación fallida)")
-                    self._abort("confirmación fallida")
+                            return
+                        log.info(f"[{self.label}] 🚫 Entrada descartada: {veto}")
+                        self._veto_entry(sig, veto)       # se descarta y esta mesa se evalúa de nuevo en la misma ronda
+                    else:
+                        log.info(f"[{self.label}] Señal descartada (confirmación fallida)")
+                        self._abort("confirmación fallida")
             else:
                 if self._resolve_entry(sig, r, hand):
                     return
@@ -2329,6 +2702,8 @@ class BaccaratTable:
         if not (gid and parsed) or gid in self.seen:
             return
         hand = make_hand(raw, gid, parsed)
+        if self.shoe_reset_pending and time.time() < self.shoe_reset_after:
+            self.shoe_reset_old.add(gid)              # llegó durante la gracia del barajado: es del zapato anterior
         for i, (g, h, sd) in enumerate(self.hand_queue):
             if g == gid:                  # ya estaba en espera: si esta versión es correcta, reemplaza a la mala
                 if validate_hand(h) and not validate_hand(hand):
@@ -2342,7 +2717,9 @@ class BaccaratTable:
     def _drain(self):
         """Procesa en orden las manos de la cola mientras estén correctas. Si la primera es inválida se detiene
         (las siguientes esperan, para no romper la secuencia) y la API se vuelve a consultar."""
+        self._apply_pending_reset()
         while self.hand_queue:
+            self._apply_pending_reset()
             gid, hand, seed = self.hand_queue[0]
             err = validate_hand(hand)
             if err:
@@ -2367,6 +2744,7 @@ class BaccaratTable:
             if len(self.seen) > 4000:
                 self.seen.clear()
             self.process_coup(hand["r"], seed, hand)
+        self._apply_pending_reset()
 
     def register_requery(self) -> int:
         self.bad_attempts += 1
@@ -2403,7 +2781,7 @@ class BaccaratTable:
             "simulada": (None if sig is None else (not sig.live)),
             "manos_zapato": len(self.shoe_sides),
             "senal": None if sig is None else {
-                "patron": sig.pattern, "lado": "Banker" if sig.expected_side == "B" else "Player",
+                "patron": sig.pattern, "lado": "Banca" if sig.expected_side == "B" else "Jugador",
                 "intento": sig.attempt, "total": sig.total_attempts,
                 "fase": "confirmación" if sig.in_confirmation else f"entrada {sig.entry_level}/{MAX_ENTRIES}",
             },
