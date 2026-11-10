@@ -137,7 +137,7 @@ TARGET_EFF_OK     = float(os.environ.get("TARGET_EFF_OK", "0.95"))
 ADAPT_WINDOW      = int(os.environ.get("ADAPT_WINDOW", "40"))               # últimas N señales resueltas que mide el control
 ADAPT_MIN         = int(os.environ.get("ADAPT_MIN", "15"))                  # señales mínimas para empezar a ajustar
 ADAPT_COOLDOWN    = int(os.environ.get("ADAPT_COOLDOWN", "5"))              # señales entre un ajuste y el siguiente
-# Gráfico de nivel (continuo entre zapatos): Player +1, Banker -1, Tie = igual que la última mano P/B. Filtro EMA 20/50/20.
+# Gráficos de nivel (4: uno por gráfico G1–G4, continuos entre zapatos): marca azul +1, marca roja -1, Tie = igual que la última marca. Filtros EMA 20/50/20 y 20/50/100.
 EMA_FILTER        = os.environ.get("EMA_FILTER", "1") == "1"
 EMA_FAST, EMA_SLOW, EMA_SIGNAL = 20, 50, 20
 EMA_MODE          = os.environ.get("EMA_MODE", "follow")                    # follow = apostar a favor del impulso · fade = en contra
@@ -1795,6 +1795,24 @@ def notify_result(table: "BaccaratTable", kind: str, level: int, side: Optional[
 # ══════════════════════════════════════════════
 #  MESA DE BACCARAT (lógica de processCoup/handleMsg del HTML)
 # ══════════════════════════════════════════════
+def feed_road_levels(sides: list, fed: dict, emas: dict, emas3: dict, r: str):
+    """Alimenta los 4 gráficos de nivel (G1 Big Road · G2 Big Eye · G3 Small · G4 Cockroach) con la mano `r`.
+    `sides` ya incluye `r` (si no es Tie). Cada marca NUEVA de un gráfico mueve SU nivel: azul (Jugador) +1, roja (Banca) -1.
+    Un Tie repite en cada gráfico el movimiento de su última marca. `fed` = marcas de cada gráfico ya contadas en este zapato
+    (se pone a cero al cambiar de zapato, pero los niveles y las EMAs continúan)."""
+    if r == "T":
+        for k in ROAD_DEFS:
+            emas[k].update("T")
+            emas3[k].update("T")
+        return
+    for k in ROAD_DEFS:
+        seq = _road_sequence(sides, k)
+        for x in seq[fed.get(k, 0):]:
+            emas[k].update(x["symbol"])
+            emas3[k].update(x["symbol"])
+        fed[k] = len(seq)
+
+
 class LevelEMA:
     """Gráfico de nivel CONTINUO entre zapatos: Player sube +1 (+1, +2, +3…), Banker baja -1 (-1, -2, -3…).
     Un Tie se cuenta como la última mano P/B anterior (si fue Banker baja -1; si fue Player sube +1).
@@ -2044,8 +2062,9 @@ class BaccaratTable:
         self.shoe_reset_old: set = set()  # manos (gid) que pertenecen al zapato que termina
         self.shoe_reset_after = 0.0       # fin de la ventana de gracia del aviso 'shuffle'
         self.last_reset_ts = 0.0
-        self.ema = LevelEMA()             # gráfico de nivel + EMA 20/50/20 (continuo entre zapatos)
-        self.ema3 = LevelEMA3()           # gráfico de nivel + EMAs 20/50/100 (continuo entre zapatos)
+        self.emas = {k: LevelEMA() for k in ROAD_DEFS}      # 4 gráficos de nivel (G1–G4) + EMA 20/50/20, continuos entre zapatos
+        self.emas3 = {k: LevelEMA3() for k in ROAD_DEFS}    # 4 gráficos de nivel (G1–G4) + EMAs 20/50/100, continuos entre zapatos
+        self.road_fed = {k: 0 for k in ROAD_DEFS}           # marcas de cada gráfico ya contadas en el zapato actual
         self.in_coup = False              # True mientras se procesa la mano de ESTA mesa (para el encabezado de ronda)
         self.round_msg_sent = False       # ¿ya salió algún pie (posible/entrada/resultado/descarte) en la ronda actual?
         self.peers: list = []             # todas las mesas (lo asigna ServerState) para el bloqueo entre mesas
@@ -2059,8 +2078,6 @@ class BaccaratTable:
         for h in hands:
             if h.get("gid") is not None:
                 self.seen.add(h["gid"])
-            self.ema.update(h.get("r"))      # el gráfico de nivel continúa entre zapatos y reinicios
-            self.ema3.update(h.get("r"))
         lib_scan_hands(self.key, hands)   # completa la biblioteca con las manos recuperadas
         LEARNED["hands"] += len(hands)
         LEARNED["restored"] += len(hands)
@@ -2082,6 +2099,18 @@ class BaccaratTable:
             self.shoe_sides = [h["r"] for h in self.shoe_hands if h.get("r") in ("P", "B")][-200:]
         else:
             self.shoe_id = sid + 1
+        # gráficos de nivel (G1–G4): se reconstruyen con todo el historial, zapato por zapato (continúan entre zapatos y reinicios)
+        sides, fed, cur_sid = [], {k: 0 for k in ROAD_DEFS}, object()
+        for h in hands:
+            if h.get("shoe_id") != cur_sid:
+                sides, fed, cur_sid = [], {k: 0 for k in ROAD_DEFS}, h.get("shoe_id")
+            r = h.get("r")
+            if r not in ("P", "B", "T"):
+                continue
+            if r != "T":
+                sides.append(r)
+            feed_road_levels(sides, fed, self.emas, self.emas3, r)
+        self.road_fed = {k: len(_road_sequence(self.shoe_sides, k)) for k in ROAD_DEFS}
         log.info(f"[{self.label}] 📚 {len(hands)} manos aprendidas recuperadas (zapato {self.shoe_id}, "
                  f"{len(self.shoe_sides)} manos en el zapato actual)")
 
@@ -2134,6 +2163,7 @@ class BaccaratTable:
         self.shoe_id += 1
         self.shoe_hands = []
         self.shoe_sides = []
+        self.road_fed = {k: 0 for k in ROAD_DEFS}   # los gráficos del zapato nuevo empiezan vacíos; los NIVELES y EMAs continúan
         try:
             self._reset_shoe_signal()
         finally:
@@ -2199,29 +2229,37 @@ class BaccaratTable:
         return ok_list
 
     def _entry_veto(self, sig: Signal) -> Optional[str]:
-        """Última revisión antes de enviar el intento 1: el filtro EMA 20/50/20 del gráfico de nivel debe estar a favor del lado."""
+        """Última revisión antes de enviar el intento 1: los filtros EMA (20/50/20 y 20/50/100) del gráfico de nivel DEL MISMO
+        GRÁFICO donde se formó el patrón (G1 Big Road · G2 Big Eye · G3 Small · G4 Cockroach) deben estar a favor del color esperado."""
         if not (ENTRY_FILTER or EMA_FILTER or EMA3_FILTER):
             return None
         dec = self._decision_for_signal(sig, 1, 1)
         if dec is None:
             return None                               # lo resuelve _start_attempt
         side = dec["expected_side"]
-        info = self.ema.snapshot()
-        info.update({"side": side, "mode": EMA_MODE, "strict": STATS.strict, "min_p": round(STATS.entry_p(), 3),
+        road = (sig.analysis or {}).get("road", "big")
+        rd = ROAD_DEFS.get(road, ROAD_DEFS["big"])
+        gtxt = f"G{rd['num']} {rd['name']}"
+        # color de la marca que se espera en ESE gráfico (en G1 es el propio lado; si el intento cambia de dirección, el color contrario)
+        color = sig.target if dec["expected_side"] == dec["keep_side"] else other_side(sig.target)
+        ema, ema3 = self.emas[road], self.emas3[road]
+        info = ema.snapshot()
+        info.update({"side": side, "road": road, "color": color, "mode": EMA_MODE, "strict": STATS.strict,
+                     "min_p": round(STATS.entry_p(), 3),
                      "gate_p": (sig.analysis or {}).get("gate_p"), "gate_n": (sig.analysis or {}).get("gate_n")})
-        ok = (not EMA_FILTER) or self.ema.allows(side)
+        ok = (not EMA_FILTER) or ema.allows(color)
         info["ema_ok"] = ok
-        info["ema3"] = self.ema3.snapshot()
-        ok3 = (not EMA3_FILTER) or self.ema3.allows(side)
+        info["ema3"] = ema3.snapshot()
+        ok3 = (not EMA3_FILTER) or ema3.allows(color)
         info["ema3_ok"] = ok3
         sig.entry_filter = info
         if not ok:
-            return (f"filtro EMA 20/50/20 en contra de {side_label(side)} (nivel {info['level']:+d} · EMA20 {info['ema20']} · "
+            return (f"filtro EMA 20/50/20 de {gtxt} en contra de {side_label(side)} (nivel {info['level']:+d} · EMA20 {info['ema20']} · "
                     f"EMA50 {info['ema50']} · MACD {info['macd']} · señal {info['signal']})")
         if not ok3:
             e3 = info["ema3"]
             tr = {"P": "alcista", "B": "bajista"}.get(e3["trend"], "sin tendencia (EMAs cruzadas)")
-            return (f"filtro EMA 20/50/100 en contra de {side_label(side)}: {tr} (nivel {e3['level']:+d} · EMA20 {e3['ema20']} · "
+            return (f"filtro EMA 20/50/100 de {gtxt} en contra de {side_label(side)}: {tr} (nivel {e3['level']:+d} · EMA20 {e3['ema20']} · "
                     f"EMA50 {e3['ema50']} · EMA100 {e3['ema100']})")
         return None
 
@@ -2395,14 +2433,18 @@ class BaccaratTable:
             use_ml = trusted and p_lib is not None and abs(p_lib - 0.5) >= margin
             expected = keep if not use_ml else (keep if p_lib > 0.5 else other_side(keep))
             source = "historial del patrón" if use_ml else ("patrón (entrenando)" if not ML.reliable() else "patrón")
-            if att2 and not use_ml and STATS.strict2 >= 1 and EMA3_FILTER and self.ema3.ready:
+            if att2 and not use_ml and STATS.strict2 >= 1 and EMA3_FILTER and self.emas3[road].ready:
                 # historial no concluyente en el intento 2 con exigencia activa: desempata la tendencia EMA 20/50/100
-                tr = self.ema3.trend()
+                # del gráfico de nivel de ESTE gráfico (G1–G4); la tendencia es de color de marca → se traduce a la mano que lo produce
+                tr = self.emas3[road].trend()
                 if tr in ("P", "B"):
-                    ema_side = other_side(tr) if EMA_MODE == "fade" else tr
-                    if ema_side != expected:
-                        expected = ema_side
-                        source += " · EMA 20/50/100"
+                    ema_color = other_side(tr) if EMA_MODE == "fade" else tr
+                    cur_color = target if expected == keep else other_side(target)
+                    if ema_color != cur_color:
+                        ema_side = hand_for_color(self.shoe_sides, road, ema_color)
+                        if ema_side is not None and ema_side != expected:
+                            expected = ema_side
+                            source += f" · EMA 20/50/100 G{ROAD_DEFS.get(road, ROAD_DEFS['big'])['num']}"
             if prev_tie:
                 source += " · tras Tie"
             last = (self.shoe_hands[-1].get("cards") or {}) if self.shoe_hands else {}
@@ -2569,8 +2611,6 @@ class BaccaratTable:
         hand["shoe_id"] = self.shoe_id
         self.shoe_hands.append(hand)
         self.history_hands.append(hand)
-        self.ema.update(r)
-        self.ema3.update(r)
         if len(self.history_hands) > HANDS_KEEP:
             self.history_hands.pop(0)
         LEARNED["hands"] += 1
@@ -2584,6 +2624,7 @@ class BaccaratTable:
             self.shoe_sides.append(r)
             if len(self.shoe_sides) > 200:
                 self.shoe_sides.pop(0)
+        feed_road_levels(self.shoe_sides, self.road_fed, self.emas, self.emas3, r)   # niveles + EMAs de G1–G4 (también con el lote inicial)
         if seed:
             return   # lote inicial: solo alimenta el historial, nunca genera señales ni estadísticas
         _c = hand.get("cards") or {}
