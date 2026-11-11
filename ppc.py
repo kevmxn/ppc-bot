@@ -169,6 +169,7 @@ MOD_PERIODS   = (4, 8, 20)
 MOD_TRIGGERS  = tuple(x.strip().upper() for x in os.environ.get("MOD_TRIGGERS", "X,R,S").split(",") if x.strip())   # X cruce 8/20 · R rebote · S racha
 MOD_ROADS     = tuple(x.strip() for x in os.environ.get("MOD_ROADS", "big,big_eye,small,cockroach").split(",") if x.strip())
 MOD_TIE_MODE  = os.environ.get("MOD_TIE_MODE", "repeat")     # repeat = Tie repite la última marca (igual que tus EMAs actuales) · skip = el Tie no mueve el nivel
+MOD_COOLDOWN  = int(os.environ.get("MOD_COOLDOWN", "1"))     # rondas que se espera tras resolverse una señal antes de volver a evaluar (1 = la ronda en que se resuelve no se evalúa)
 COL3_MIN_ROADS = int(os.environ.get("COL3_MIN_ROADS", "2"))  # C3: gráficos que deben coincidir en la misma mano
 AUDIT_SAVE_EVERY = int(os.environ.get("AUDIT_SAVE_EVERY", "20"))
 
@@ -1146,10 +1147,7 @@ def side_label(side: str) -> str:
 
 def build_attempt_message(label: str, sig: "Signal", att: dict) -> str:
     """Pie de la señal: 🏁 Entrada: $200 a Banca 🔴 1/3"""
-    head = ""
-    if getattr(sig, "engine", "") == "moderate":
-        head = f"C{sig.col}/G{ROAD_DEFS.get((sig.analysis or {}).get('road'), ROAD_DEFS['big'])['num']} · "
-    return f"🏁 {head}Entrada: ${att['stake_amount']} a {side_label(att['bet_side'])} {att['level']}/{MAX_ENTRIES}"
+    return f"🏁 Entrada: ${att['stake_amount']} a {side_label(att['bet_side'])} {att['level']}/{MAX_ENTRIES}"
 
 def _strip_suit(label) -> str:
     return re.sub(r"[♠♥♦♣]", "", str(label)).strip()
@@ -1318,7 +1316,7 @@ class GlobalStats:
         lines.append(f"📈 Efectividad Global = {self._pct(sum(self.wins))}")
         lines.append(f"💰 Ganancia Neta = {money(self.profit)}")
         if ENGINE == "moderate":
-            lines.append(COLS.summary())
+            lines.append(f"🚨 Nivel de Filtro = C{COLS.col}")
         return "\n".join(lines)
 
     def to_persist(self):
@@ -2355,6 +2353,7 @@ class BaccaratTable:
         self.emas48 = {k: LevelEMA48() for k in ROAD_DEFS}  # 4 gráficos de nivel (G1–G4) + cruce de EMAs 4/8, continuos entre zapatos
         self.emasm = {k: LevelMod() for k in ROAD_DEFS}     # 4 gráficos de nivel (G1–G4) + EMAs 4/8/20 del Moderado, continuos entre zapatos
         self.mod_fresh: dict = {}                           # gráficos que recibieron una marca nueva en la última mano
+        self.mod_wait = 0                                   # rondas extra de espera tras resolver una señal
         self.mod_cands: list = []                           # disparadores de la última mano (con mano a apostar definida)
         self.road_fed = {k: 0 for k in ROAD_DEFS}           # marcas de cada gráfico ya contadas en el zapato actual
         self.in_coup = False              # True mientras se procesa la mano de ESTA mesa (para el encabezado de ronda)
@@ -3113,6 +3112,13 @@ class BaccaratTable:
         if live and self._other_confirmed() is not None:
             return   # hay una entrada confirmada en otra mesa: no se envían señales hasta que se resuelva
         if ENGINE == "moderate":
+            if sig is not None:                 # la señal se resolvió en ESTA ronda: no se evalúa hasta la siguiente
+                self.mod_wait = max(0, MOD_COOLDOWN - 1)
+                log.info(f"[{self.label}] ⏸ Señal resuelta: se espera {max(1, MOD_COOLDOWN)} ronda(s) antes de volver a evaluar")
+                return
+            if self.mod_wait > 0:
+                self.mod_wait -= 1
+                return
             det = self.detect_moderate(r)
             if det:
                 self.start_signal_mod(det, live)
