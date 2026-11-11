@@ -1,12 +1,15 @@
 """
 BOT BACCARAT — PRAGMATIC PLAY · SOLO BACCARAT 1
 ════════════════════════════════════════════════
-MOTOR NUEVO (ENGINE=moderate, por defecto) — lógica del gráfico "Moderado" 2x del HTML AMX_V20 + columnas C1/C2/C3
+MOTOR NUEVO (ENGINE=moderate, por defecto) — lógica del gráfico "Moderado" 2x del HTML AMX_V20 + niveles de filtro C2 / C2.5 / C3
   · Cada gráfico G1–G4 tiene su gráfico de NIVEL (azul +1 / rojo −1) con EMAs 4/8/20 (clase LevelMod).
   · 3 disparadores (espejados para Player y Banker):
       X = cruce EMA8/EMA20 · R = rebote (sube-baja y sigue sobre las 3 EMAs) · S = 2.ª marca seguida con EMA4>EMA8>EMA20
-  · Dinero real: columnas C1→C2→C3, 2 intentos por columna (principal + 2.ª oportunidad). Ganar vuelve a C1;
-    perder los 2 intentos pasa a la columna siguiente, que EXIGE MÁS filtros (ver _col_gate).
+  · Dinero real: niveles C2→C2.5→C3 (el C1 ya no existe), 2 intentos por nivel (principal + 2.ª oportunidad). Ganar en C2/C2.5 vuelve a C2;
+    perder los 2 intentos pasa al nivel siguiente, que EXIGE MÁS filtros (ver _col_gate):
+    Los 3 niveles exigen la alerta del Moderado: C2 = + EMA 10/30/10 · C2.5 = C2 + EMA 20/50/100 + EMA 4/8 · C3 = C2.5 + EMA 20/50/20 + 2 gráficos coincidentes.
+    En cada intento 2+ se re-pesan los 4 gráficos (alertas + EMAs): puede invertir la dirección y cambiar el gráfico guía.
+    Al llegar a C3 se MANTIENE ahí hasta recuperar todo lo perdido en C2 + C2.5 (y lo que se pierda en C3); entonces vuelve a C2.
   · Los 12 patrones, la biblioteca de cartas y el ML quedan apagados (ENGINE=pattern los reactiva).
   · Auditoría (ModAudit): mide acierto de cada disparador por gráfico contra el azar → sirve para decidir qué conservar.
 
@@ -90,11 +93,17 @@ TG_SEND_RETRIES = 8      # reintentos por mensaje hasta que Telegram confirme
 TG_MIN_GAP      = 0.5    # segundos entre mensajes (evita límites de Telegram)
 
 # ── Señales / gestión ──
-ENGINE       = os.environ.get("ENGINE", "moderate").strip().lower()      # moderate = lógica del gráfico Moderado + C1/C2/C3 · pattern = 12 patrones (legado)
+ENGINE       = os.environ.get("ENGINE", "moderate").strip().lower()      # moderate = lógica del gráfico Moderado + niveles C2/C2.5/C3 · pattern = 12 patrones (legado)
 if ENGINE not in ("moderate", "pattern"):
     ENGINE = "moderate"
 MOD_ATTEMPTS = int(os.environ.get("MOD_ATTEMPTS", "2"))     # intentos por columna (HTML: S_MAX_ATT = 2 → principal + 2.ª oportunidad)
-MOD_COLUMNS  = int(os.environ.get("MOD_COLUMNS", "3"))      # columnas C1..C3
+MOD_COLUMNS  = int(os.environ.get("MOD_COLUMNS", "3"))      # niveles de filtro: C2 → C2.5 → C3 (el C1 ya no existe)
+COL_NAMES    = ("C2", "C2.5", "C3")                         # nombre visible de cada nivel (posición 1, 2, 3)
+
+
+def col_name(i: int) -> str:
+    return COL_NAMES[i - 1] if 1 <= i <= len(COL_NAMES) else f"C{i}"
+
 MOD_SCALES   = int(os.environ.get("MOD_SCALES", "10"))      # escalones del ciclo (HTML: 10)
 MAX_ENTRIES = MOD_ATTEMPTS if ENGINE == "moderate" else 3   # entradas reales (intentos) por señal
 LAB_UNIT    = int(os.environ.get("LAB_UNIT", "100"))      # valor de 1 unidad de Labouchere (también la apuesta mínima)
@@ -103,7 +112,7 @@ LAB_ROUND   = LAB_UNIT                                    # la ficha mínima es 
 LAB_START   = [1, 1, 1]                                   # secuencia inicial de Labouchere
 TIE_AMOUNT  = int(os.environ.get("TIE_AMOUNT", "100"))    # apuesta opcional a Tie
 STATS_FILE  = os.environ.get("STATS_FILE", "baccarat_stats.json" if ENGINE == "pattern" else "baccarat_stats_mod.json")
-COLS_FILE   = os.environ.get("COLS_FILE", "baccarat_columns.json")        # estado C1/C2/C3
+COLS_FILE   = os.environ.get("COLS_FILE", "baccarat_columns.json")        # estado C2/C2.5/C3
 AUDIT_FILE  = os.environ.get("AUDIT_FILE", "baccarat_audit.json")        # acierto de cada disparador por gráfico
 SHOE_IMAGE        = os.environ.get("SHOE_IMAGE", "1") == "1"                         # 1 = cada mensaje de señal/resultado va como pie de la imagen del zapato
 SHOE_IMG_ROUNDS   = 84                                                              # rondas que caben en la imagen (14 columnas × 6 filas)
@@ -166,10 +175,14 @@ EMA_REQUIRE_TREND = os.environ.get("EMA_REQUIRE_TREND", "0") == "1"         # 1 
 
 # ── Motor Moderado (gráfico de nivel con EMAs 4/8/20 + disparadores X/R/S) ──
 MOD_PERIODS   = (4, 8, 20)
+C2_EMA        = (10, 30, 10)                                 # EMA del filtro del nivel C2 (rápida/lenta/señal, estilo 20/50/20)
 MOD_TRIGGERS  = tuple(x.strip().upper() for x in os.environ.get("MOD_TRIGGERS", "X,R,S").split(",") if x.strip())   # X cruce 8/20 · R rebote · S racha
 MOD_ROADS     = tuple(x.strip() for x in os.environ.get("MOD_ROADS", "big,big_eye,small,cockroach").split(",") if x.strip())
 MOD_TIE_MODE  = os.environ.get("MOD_TIE_MODE", "repeat")     # repeat = Tie repite la última marca (igual que tus EMAs actuales) · skip = el Tie no mueve el nivel
 MOD_COOLDOWN  = int(os.environ.get("MOD_COOLDOWN", "1"))     # rondas que se espera tras resolverse una señal antes de volver a evaluar (1 = la ronda en que se resuelve no se evalúa)
+MOD_REASSESS   = int(os.environ.get("MOD_REASSESS", "1"))      # 1 = en cada intento 2+ se re-evalúan los 4 gráficos (peso por mano) y se puede cambiar de dirección / de gráfico guía
+MOD_FLIP_MARGIN = int(os.environ.get("MOD_FLIP_MARGIN", "2"))  # puntos de ventaja que necesita la mano contraria para invertir la dirección
+MOD_W_ALERT    = int(os.environ.get("MOD_W_ALERT", "2"))      # puntos por cada disparador (X/R/S) activo en esta ronda
 COL3_MIN_ROADS = int(os.environ.get("COL3_MIN_ROADS", "2"))  # C3: gráficos que deben coincidir en la misma mano
 AUDIT_SAVE_EVERY = int(os.environ.get("AUDIT_SAVE_EVERY", "20"))
 
@@ -1316,7 +1329,7 @@ class GlobalStats:
         lines.append(f"📈 Efectividad Global = {self._pct(sum(self.wins))}")
         lines.append(f"💰 Ganancia Neta = {money(self.profit)}")
         if ENGINE == "moderate":
-            lines.append(f"🚨 Nivel de Filtro = C{COLS.col}")
+            lines.append(f"🚨 Nivel de Filtro = {col_name(COLS.col)}")
         return "\n".join(lines)
 
     def to_persist(self):
@@ -1827,7 +1840,7 @@ def notify_result(table: "BaccaratTable", kind: str, level: int, side: Optional[
 # ══════════════════════════════════════════════
 #  MESA DE BACCARAT (lógica de processCoup/handleMsg del HTML)
 # ══════════════════════════════════════════════
-def feed_road_levels(sides: list, fed: dict, emas: dict, emas3: dict, r: str, emas48: Optional[dict] = None, emasm: Optional[dict] = None):
+def feed_road_levels(sides: list, fed: dict, emas: dict, emas3: dict, r: str, emas48: Optional[dict] = None, emasm: Optional[dict] = None, emas10: Optional[dict] = None):
     """Alimenta los 4 gráficos de nivel (G1 Big Road · G2 Big Eye · G3 Small · G4 Cockroach) con la mano `r`.
     `sides` ya incluye `r` (si no es Tie). Cada marca NUEVA de un gráfico mueve SU nivel: azul (Jugador) +1, roja (Banca) -1.
     Un Tie repite en cada gráfico el movimiento de su última marca. `fed` = marcas de cada gráfico ya contadas en este zapato
@@ -1840,6 +1853,8 @@ def feed_road_levels(sides: list, fed: dict, emas: dict, emas3: dict, r: str, em
                 emas48[k].update("T")
             if emasm is not None:
                 emasm[k].update("T")
+            if emas10 is not None:
+                emas10[k].update("T")
         return
     for k in ROAD_DEFS:
         seq = _road_sequence(sides, k)
@@ -1850,6 +1865,8 @@ def feed_road_levels(sides: list, fed: dict, emas: dict, emas3: dict, r: str, em
                 emas48[k].update(x["symbol"])
             if emasm is not None:
                 emasm[k].update(x["symbol"])
+            if emas10 is not None:
+                emas10[k].update(x["symbol"])
         fed[k] = len(seq)
 
 
@@ -2100,41 +2117,61 @@ class LevelMod:
 
 
 class RealColumns:
-    """Estrategia de dinero real del HTML (Martingale 2×3): ciclo de escalones; en cada escalón hasta MOD_COLUMNS columnas
-    (C1, C2, C3) y en cada columna MOD_ATTEMPTS intentos. Una señal = una columna.
-      · Ganar (en cualquier intento) → vuelve a C1 y sube un escalón.
-      · Perder todos los intentos → pasa a la columna siguiente (más filtros). Si se pierde la última, el ciclo se pierde y se reinicia.
-    Cada columna exige más confirmación (ver BaccaratTable._col_gate)."""
+    """Estrategia de dinero real del HTML: niveles C2, C2.5, C3 (posiciones 1, 2, 3) con MOD_ATTEMPTS intentos cada uno (una señal = un nivel).
+      · C2 o C2.5: ganar vuelve a C2 (y sube un escalón); perder los intentos pasa al nivel siguiente (más filtros).
+      · C3: se ACUMULA la deuda = dinero perdido en C2 + C2.5. En C3 el bot se MANTIENE (con los filtros más estrictos),
+        gane o pierda, hasta que las ganancias recuperen toda la deuda; solo entonces vuelve a C2.
+        Una pérdida en C3 suma a la deuda; una victoria la reduce."""
     def __init__(self):
         self.col, self.scale = 1, 1
-        self.cycles_ok = self.cycles_lost = 0
+        self.debt = 0                 # dinero perdido por recuperar (solo se usa en C3)
+        self.cycles_ok = 0            # ciclos de escalones completados
+        self.cycles_lost = 0          # (compatibilidad) ya no se pierde el ciclo: se mantiene en C3
+        self.recovered = 0            # veces que se recuperó la deuda de C3 y se volvió a C2
         self.col_wins = [0] * MOD_COLUMNS
         self.col_losses = [0] * MOD_COLUMNS
 
-    def on_result(self, win: bool, col: int):
-        i = max(1, min(col, MOD_COLUMNS)) - 1
+    def _next_scale(self):
+        self.scale += 1
+        if self.scale > MOD_SCALES:
+            self.cycles_ok += 1
+            self.scale = 1
+
+    def on_result(self, win: bool, col: int, profit: int = 0):
+        """profit = ganancia neta (negativa si se perdió) de la señal que acaba de cerrar."""
+        last = MOD_COLUMNS
+        i = max(1, min(col, last)) - 1
         if win:
             self.col_wins[i] += 1
-            self.col = 1
-            self.scale += 1
-            if self.scale > MOD_SCALES:
-                self.cycles_ok += 1
-                self.scale = 1
         else:
             self.col_losses[i] += 1
-            self.col += 1
-            if self.col > MOD_COLUMNS:
-                self.cycles_lost += 1
-                self.col, self.scale = 1, 1
-                log.info("⚠️ Ciclo perdido: se agotaron las columnas → vuelve a C1 · Esc 1")
+        if col >= last:                                   # ── en la última columna: se mantiene hasta recuperar
+            self.debt -= int(profit)                      # profit>0 reduce la deuda · profit<0 la aumenta
+            if win and self.debt <= 0:
+                log.info(f"✅ Deuda de {col_name(1)} + {col_name(2)} recuperada → vuelve a {col_name(1)}")
+                self.debt = 0
+                self.recovered += 1
+                self.col = 1
+                self._next_scale()
+            else:
+                self.col = last
+                if win:
+                    log.info(f"↪️ {self.label()}: se mantiene en {col_name(last)} hasta recuperar")
+        elif win:                                         # ── el 1.º y 2.º nivel ganan: se vuelve al 1.º
+            self.col, self.debt = 1, 0
+            self._next_scale()
+        else:                                             # ── el 1.º y 2.º nivel pierden: sube de nivel y acumula deuda
+            self.debt += max(0, -int(profit))
+            self.col = col + 1
         self.save()
 
     def label(self) -> str:
-        return f"C{self.col} · Esc {self.scale}"
+        extra = f" · deuda ${self.debt}" if self.col >= MOD_COLUMNS and self.debt > 0 else ""
+        return f"{col_name(self.col)} · Esc {self.scale}{extra}"
 
     def summary(self) -> str:
-        cw = " ".join(f"C{i+1} {w}✅/{l}❌" for i, (w, l) in enumerate(zip(self.col_wins, self.col_losses)))
-        return f"📍 {self.label()} · ciclos ✅{self.cycles_ok} ❌{self.cycles_lost} · {cw}"
+        cw = " ".join(f"{col_name(i+1)} {w}✅/{l}❌" for i, (w, l) in enumerate(zip(self.col_wins, self.col_losses)))
+        return f"📍 {self.label()} · ciclos ✅{self.cycles_ok} · recuperaciones C3 {self.recovered} · {cw}"
 
     def save(self):
         try:
@@ -2150,7 +2187,9 @@ class RealColumns:
                 d = json.load(open(COLS_FILE))
                 self.col = max(1, min(MOD_COLUMNS, int(d.get("col", 1))))
                 self.scale = max(1, int(d.get("scale", 1)))
+                self.debt = int(d.get("debt", 0))
                 self.cycles_ok, self.cycles_lost = int(d.get("cycles_ok", 0)), int(d.get("cycles_lost", 0))
+                self.recovered = int(d.get("recovered", 0))
                 for key in ("col_wins", "col_losses"):
                     v = d.get(key)
                     if isinstance(v, list) and len(v) == MOD_COLUMNS:
@@ -2162,7 +2201,7 @@ COLS = RealColumns()
 
 
 class ModAudit:
-    """Mide, para CADA disparador y gráfico (sin importar filtros C1–C3 ni señales activas), cuántas veces la mano que
+    """Mide, para CADA disparador y gráfico (sin importar filtros C2–C3 ni señales activas), cuántas veces la mano que
     se habría apostado salió en la ronda siguiente (Tie no cuenta) y la compara con el azar (P 49.3% · B 50.7% sin Tie).
     Con esto se decide con datos qué disparadores/gráficos conservar (MOD_TRIGGERS / MOD_ROADS)."""
     BASE = {"P": 0.4931, "B": 0.5069}
@@ -2249,8 +2288,8 @@ class Signal:
     alts: list = field(default_factory=list)   # otros patrones que se cumplieron a la vez (p. ej. PBBP dentro de BPBBP)
     switched_from: Optional[str] = None      # patrón con el que empezó la señal si se cambió a una alternativa
     entry_filter: dict = field(default_factory=dict)   # estado del filtro EMA / exigencia cuando se decidió la entrada
-    engine: str = "pattern"                  # "moderate" = señal del motor Moderado (una columna C1/C2/C3)
-    col: int = 0                             # columna (C1..C3) en la que se decidió la entrada
+    engine: str = "pattern"                  # "moderate" = señal del motor Moderado (una nivel C2/C2.5/C3)
+    col: int = 0                             # nivel (C2, C2.5, C3) en la que se decidió la entrada
 
     @property
     def in_confirmation(self) -> bool:
@@ -2350,6 +2389,7 @@ class BaccaratTable:
         self.last_reset_ts = 0.0
         self.emas = {k: LevelEMA() for k in ROAD_DEFS}      # 4 gráficos de nivel (G1–G4) + EMA 20/50/20, continuos entre zapatos
         self.emas3 = {k: LevelEMA3() for k in ROAD_DEFS}    # 4 gráficos de nivel (G1–G4) + EMAs 20/50/100, continuos entre zapatos
+        self.emas10 = {k: LevelEMA(*C2_EMA) for k in ROAD_DEFS}   # 4 gráficos de nivel + EMA 10/30/10 (filtro del nivel C2), continuos entre zapatos
         self.emas48 = {k: LevelEMA48() for k in ROAD_DEFS}  # 4 gráficos de nivel (G1–G4) + cruce de EMAs 4/8, continuos entre zapatos
         self.emasm = {k: LevelMod() for k in ROAD_DEFS}     # 4 gráficos de nivel (G1–G4) + EMAs 4/8/20 del Moderado, continuos entre zapatos
         self.mod_fresh: dict = {}                           # gráficos que recibieron una marca nueva en la última mano
@@ -2401,7 +2441,7 @@ class BaccaratTable:
                 continue
             if r != "T":
                 sides.append(r)
-            feed_road_levels(sides, fed, self.emas, self.emas3, r, self.emas48, self.emasm)
+            feed_road_levels(sides, fed, self.emas, self.emas3, r, self.emas48, self.emasm, self.emas10)
         self.road_fed = {k: len(_road_sequence(self.shoe_sides, k)) for k in ROAD_DEFS}
         log.info(f"[{self.label}] 📚 {len(hands)} manos aprendidas recuperadas (zapato {self.shoe_id}, "
                  f"{len(self.shoe_sides)} manos en el zapato actual)")
@@ -2570,7 +2610,7 @@ class BaccaratTable:
         append_signal_log(build_signal_record(self, sig, "discarded", reason))
         self.signal = None
 
-    # ══════════ MOTOR MODERADO (gráfico de nivel 4/8/20 + columnas C1/C2/C3) ══════════
+    # ══════════ MOTOR MODERADO (gráfico de nivel 4/8/20 + niveles C2/C2.5/C3) ══════════
     def _mod_scan(self, r: str):
         """Tras cada mano: resuelve la auditoría pendiente y registra los disparadores nuevos de los 4 gráficos."""
         self.mod_cands = []
@@ -2596,27 +2636,64 @@ class BaccaratTable:
                     self.mod_cands.append(cand)
 
     def _col_gate(self, col: int, cand: dict, cands: list):
-        """Filtros por columna (se acumulan):
-          C1 = alerta del Moderado (cualquier disparador en cualquier gráfico, sin alertas contrarias dominantes).
-          C2 = C1 + tendencia EMA 20/50/100 del MISMO gráfico a favor del color.
-          C3 = C2 + cruce EMA 4/8 a favor + EMA 20/50/20 a favor + al menos COL3_MIN_ROADS gráficos coincidiendo en la misma mano.
+        """Filtros por nivel. En los TRES niveles se exige la lógica del Moderado (alerta X/R/S sobre el gráfico de nivel 4/8/20,
+        que es lo que genera `cand`); cada nivel añade más EMAs a favor (acumulativo):
+          C2   = Moderado + EMA 10/30/10 del MISMO gráfico a favor del color.
+          C2.5 = C2 + EMA 20/50/100 + cruce EMA 4/8 a favor (más exigente, sin llegar a C3).
+          C3   = C2.5 + EMA 20/50/20 a favor + al menos COL3_MIN_ROADS gráficos coincidiendo en la misma mano.
         Los filtros EMA no bloquean mientras el gráfico no tenga datos suficientes (igual que antes)."""
         road, color = cand["road"], cand["color"]
         g = f"G{ROAD_DEFS[road]['num']}"
-        if col >= 2 and EMA3_FILTER and not self.emas3[road].allows(color):
-            return False, f"C{col}: EMA 20/50/100 de {g} no apoya {side_label(cand['bet'])}"
-        if col >= 3:
+        lado = side_label(cand["bet"])
+        nm = col_name(col)
+        if col >= 1 and not self.emas10[road].allows(color):
+            return False, f"{nm}: EMA 10/30/10 de {g} no apoya {lado}"
+        if col >= 2:
+            if EMA3_FILTER and not self.emas3[road].allows(color):
+                return False, f"{nm}: EMA 20/50/100 de {g} no apoya {lado}"
             if not self.emas48[road].allows(color):
-                return False, f"C{col}: cruce EMA 4/8 de {g} no apoya {side_label(cand['bet'])}"
+                return False, f"{nm}: cruce EMA 4/8 de {g} no apoya {lado}"
+        if col >= 3:
             if not self.emas[road].allows(color):
-                return False, f"C{col}: EMA 20/50/20 de {g} no apoya {side_label(cand['bet'])}"
-            if len({x["road"] for x in cands}) < COL3_MIN_ROADS:
-                return False, f"C{col}: solo {len({x['road'] for x in cands})} gráfico(s) coinciden (mín. {COL3_MIN_ROADS})"
+                return False, f"{nm}: EMA 20/50/20 de {g} no apoya {lado}"
+            n_roads = len({x["road"] for x in cands})
+            if n_roads < COL3_MIN_ROADS:
+                return False, f"{nm}: solo {n_roads} gráfico(s) coinciden (mín. {COL3_MIN_ROADS})"
         return True, ""
+
+    def _mod_weights(self) -> dict:
+        """Peso de cada MANO (P/B) según los 4 gráficos AHORA. Por gráfico y color (traducido a mano con hand_for_color):
+          +MOD_W_ALERT por cada disparador X/R/S que salió en esta ronda · +1 niveles 4/8/20 alineados a favor ·
+          +1 por cada filtro EMA a favor (10/30/10 · 20/50/100 · 4/8 · 20/50/20) con datos suficientes.
+        Devuelve {"W": {"P": n, "B": n}, "roads": {"P": {gráfico: pts}, "B": {...}}}."""
+        W = {"P": 0, "B": 0}
+        by_road = {"P": {}, "B": {}}
+        now = {(c["road"], c["color"]): c["kinds"] for c in self.mod_cands}
+        for road in MOD_ROADS:
+            if road not in ROAD_DEFS:
+                continue
+            lv = self.emasm[road]
+            if not lv.ready:
+                continue
+            e4, e8, e20 = lv.e
+            for color in ("P", "B"):
+                hand = hand_for_color(self.shoe_sides, road, color)
+                if hand is None:
+                    continue
+                d = 1 if color == "P" else -1
+                pts = MOD_W_ALERT * len(now.get((road, color), ()))
+                if d * (e4 - e8) > 0 and d * (e8 - e20) > 0:
+                    pts += 1
+                for ema in (self.emas10[road], self.emas3[road], self.emas48[road], self.emas[road]):
+                    if ema.ready and ema.allows(color):
+                        pts += 1
+                by_road[hand][road] = by_road[hand].get(road, 0) + pts
+                W[hand] += pts
+        return {"W": W, "roads": by_road}
 
     def detect_moderate(self, r: str):
         """¿Hay entrada AHORA? Alertas de los gráficos → mano a apostar (mayoría de gráficos; empate = no entrar) → filtro de la
-        columna actual (C1/C2/C3). Devuelve el diccionario de la señal o None."""
+        columna actual (C2/C2.5/C3). Devuelve el diccionario de la señal o None."""
         if r == "T" or not self.mod_cands:
             return None
         votes = {"P": [], "B": []}
@@ -2649,7 +2726,7 @@ class BaccaratTable:
         col = det["col"]
         rd = ROAD_DEFS[det["road"]]
         self.signal = Signal(
-            key="MOD", pattern=f"C{col} · G{rd['num']} {rd['name']} · {det['pattern']}",
+            key="MOD", pattern=f"{col_name(col)} · G{rd['num']} {rd['name']} · {det['pattern']}",
             target=det["target"], last=self.shoe_sides[-1] if self.shoe_sides else "",
             confirm_total=0, total_attempts=MAX_ENTRIES, live=live, confirm="", strategy=0,
             pattern_info=dict(det), pattern_hands=list(self.shoe_hands[-12:]), shoe_pos=len(self.shoe_hands),
@@ -2800,18 +2877,46 @@ class BaccaratTable:
         target = sig.target
         road = det.get("road", "big")
         if sig.engine == "moderate":
-            # Intento 1 = la mano de la alerta. Intento 2 (2.ª oportunidad) = mismo color objetivo en el mismo gráfico, traducido a la mano actual.
+            # Intento 1 = la mano de la alerta (ya salió de comparar los 4 gráficos). Intentos 2+ (2.ª oportunidad y repeticiones tras Tie):
+            # se vuelven a pesar los 4 gráficos; si la mano contraria pesa MOD_FLIP_MARGIN puntos más se invierte la dirección, y el gráfico
+            # guía pasa a ser el de más peso para la mano elegida.
+            wt = self._mod_weights() if MOD_REASSESS else None
+            flip = False
+            old_road = road
             if level == 1:
-                side = det["bet_side"]
+                keep = side = det["bet_side"]
             elif sig.shoe_changed and sig.carry_keep:
-                side = sig.carry_keep
+                keep = side = sig.carry_keep
             else:
-                side = hand_for_color(self.shoe_sides, road, target) or sig.bet_side
+                keep = side = hand_for_color(self.shoe_sides, road, target) or sig.bet_side
+                if wt:
+                    opp = other_side(keep)
+                    if wt["W"][opp] >= wt["W"][keep] + MOD_FLIP_MARGIN:
+                        side, flip = opp, True
+                    rs = wt["roads"][side]
+                    best = max(rs, key=lambda k: (rs[k], -ROAD_DEFS[k]["num"])) if rs else None
+                    if best and (best != road or flip):
+                        col_new = next((c for c in ("P", "B") if hand_for_color(self.shoe_sides, best, c) == side), None)
+                        if col_new:
+                            sig.orig_target = sig.orig_target or sig.target
+                            rd2 = ROAD_DEFS[best]
+                            det.update({"road": best, "road_name": rd2["name"], "symbol": rd2["symbol"],
+                                        "target": col_new, "line_focus": rd2["symbol"] == "/"})
+                            sig.target, road = col_new, best
+                    if flip:
+                        sig.flipped = True
+                    log.info(f"[{self.label}] ⚖️ Intento {level}: pesos P={wt['W']['P']} B={wt['W']['B']} · "
+                             f"{'🔄 cambia a ' + side_label(side) if flip else 'mantiene ' + side_label(side)}"
+                             f" · gráfico guía G{ROAD_DEFS[road]['num']}" + (f" (antes G{ROAD_DEFS[old_road]['num']})" if road != old_road else ""))
             prev_tie = bool(self.shoe_hands) and self.shoe_hands[-1].get("r") == "T"
-            return {"mode": "moderate", "source": f"Moderado {det.get('pattern')} · C{sig.col}", "p_keep": None,
-                    "keep_side": side, "expected_side": side, "candidate": det, "models": {}, "n_rows": 0,
+            cand = dict(det)
+            cand.update({"attempt": level, "flipped": flip, "keep_side": keep, "weights": (wt or {}).get("W"),
+                         "weights_roads": (wt or {}).get("roads")})
+            return {"mode": "moderate", "source": f"Moderado {det.get('pattern')} · {col_name(sig.col)}", "p_keep": None,
+                    "keep_side": keep, "expected_side": side, "candidate": cand, "models": {}, "n_rows": 0,
                     "features": {"road": road, "pattern": f"{road}|{det.get('pattern')}", "phase": 1, "level": level,
-                                 "target": target, "prev_tie": prev_tie, "col": sig.col}}
+                                 "target": sig.target, "prev_tie": prev_tie, "col": sig.col, "flipped": flip,
+                                 "weights": (wt or {}).get("W")}}
         # tras un cambio de zapato los gráficos derivados quedan vacíos: se conserva la mano que ya se venía apostando
         keep = sig.carry_keep if (sig.shoe_changed and sig.carry_keep) else hand_for_color(self.shoe_sides, road, target)
         if keep is None:
@@ -2970,7 +3075,7 @@ class BaccaratTable:
         record = build_signal_record(self, sig, kind)
         append_signal_log(record)
         if sig.engine == "moderate":
-            COLS.on_result(kind == "win", sig.col)
+            COLS.on_result(kind == "win", sig.col, signal_profit(sig))
             log.info(f"[{self.label}] 📍 Siguiente: {COLS.label()}")
         else:
             was_reliable = ML.reliable()
@@ -2982,7 +3087,7 @@ class BaccaratTable:
                 log.info("🔔 Cambio de estado del bot → " + ML.readiness_text().replace("\n", " "))
         if sig.live:
             hand = (sig.attempts[-1].get("hand") or {}) if sig.attempts else {}
-            notify_result(self, kind, level, hand.get("r"), hand, signal_profit(sig), tag=(f"C{sig.col}" if sig.engine == "moderate" else ""))
+            notify_result(self, kind, level, hand.get("r"), hand, signal_profit(sig), tag=(col_name(sig.col) if sig.engine == "moderate" else ""))
 
     def _abort(self, reason: str):
         """Señal que termina sin resultado (confirmación fallida, bloqueo, cambio de zapato)."""
@@ -3034,7 +3139,7 @@ class BaccaratTable:
             if len(self.shoe_sides) > 200:
                 self.shoe_sides.pop(0)
         _n0 = {k: self.emasm[k].n for k in ROAD_DEFS}
-        feed_road_levels(self.shoe_sides, self.road_fed, self.emas, self.emas3, r, self.emas48, self.emasm)   # niveles + EMAs de G1–G4 (también con el lote inicial)
+        feed_road_levels(self.shoe_sides, self.road_fed, self.emas, self.emas3, r, self.emas48, self.emasm, self.emas10)   # niveles + EMAs de G1–G4 (también con el lote inicial)
         self.mod_fresh = {k: self.emasm[k].n != _n0[k] for k in ROAD_DEFS}
         if seed:
             self.mod_cands = []
