@@ -7,9 +7,12 @@ MOTOR NUEVO (ENGINE=moderate, por defecto) — lógica del gráfico "Moderado" 2
       X = cruce EMA8/EMA20 · R = rebote (sube-baja y sigue sobre las 3 EMAs) · S = 2.ª marca seguida con EMA4>EMA8>EMA20
   · Dinero real: niveles C2→C2.5→C3 (el C1 ya no existe), 2 intentos por nivel (principal + 2.ª oportunidad). Ganar en C2/C2.5 vuelve a C2;
     perder los 2 intentos pasa al nivel siguiente, que EXIGE MÁS filtros (ver _col_gate):
-    Los 3 niveles exigen la alerta del Moderado: C2 = + EMA 10/30/10 · C2.5 = C2 + EMA 20/50/100 + EMA 4/8 · C3 = C2.5 + EMA 20/50/20 + 2 gráficos coincidentes.
+    Los 3 niveles exigen la alerta del Moderado en 2 gráficos que coincidan: C2 = + EMA 10/30/10 · C2.5 = C2 + EMA 20/50/100 + EMA 4/8 · C3 = C2.5 + EMA 20/50/20.
     En cada intento 2+ se re-pesan los 4 gráficos (alertas + EMAs): puede invertir la dirección y cambiar el gráfico guía.
     Al llegar a C3 se MANTIENE ahí hasta recuperar todo lo perdido en C2 + C2.5 (y lo que se pierda en C3); entonces vuelve a C2.
+  · Mensajes SIN foto. Si hay alerta válida en un gráfico pero aún no coinciden los gráficos requeridos, se envía
+    "⚠ POSIBLE ENTRADA A CONFIRMAR EN ESTA RONDA ⚠"; en la ronda siguiente, si ya coinciden → entra y el aviso se borra;
+    si no → se descarta y se borra. Las rondas sin alerta no publican nada.
   · Los 12 patrones, la biblioteca de cartas y el ML quedan apagados (ENGINE=pattern los reactiva).
   · Auditoría (ModAudit): mide acierto de cada disparador por gráfico contra el azar → sirve para decidir qué conservar.
 
@@ -114,7 +117,8 @@ TIE_AMOUNT  = int(os.environ.get("TIE_AMOUNT", "100"))    # apuesta opcional a T
 STATS_FILE  = os.environ.get("STATS_FILE", "baccarat_stats.json" if ENGINE == "pattern" else "baccarat_stats_mod.json")
 COLS_FILE   = os.environ.get("COLS_FILE", "baccarat_columns.json")        # estado C2/C2.5/C3
 AUDIT_FILE  = os.environ.get("AUDIT_FILE", "baccarat_audit.json")        # acierto de cada disparador por gráfico
-SHOE_IMAGE        = os.environ.get("SHOE_IMAGE", "1") == "1"                         # 1 = cada mensaje de señal/resultado va como pie de la imagen del zapato
+SHOE_IMAGE        = os.environ.get("SHOE_IMAGE", "0") == "1"                         # 0 (por defecto) = SIN foto: todos los mensajes salen como texto · 1 = pie de la imagen del zapato
+POSSIBLE_TEXT     = "⚠ POSIBLE ENTRADA A CONFIRMAR EN ESTA RONDA ⚠"                  # aviso de posible entrada (se borra al confirmar o descartar)
 SHOE_IMG_ROUNDS   = 84                                                              # rondas que caben en la imagen (14 columnas × 6 filas)
 KEEP_MESSAGES    = True                                                             # los mensajes (imagen + pie) quedan en el chat: no se borra nada
 SHOE_IMG_ROWS     = 6                                                               # filas (se llena de arriba hacia abajo, columna por columna)
@@ -183,7 +187,7 @@ MOD_COOLDOWN  = int(os.environ.get("MOD_COOLDOWN", "1"))     # rondas que se esp
 MOD_REASSESS   = int(os.environ.get("MOD_REASSESS", "1"))      # 1 = en cada intento 2+ se re-evalúan los 4 gráficos (peso por mano) y se puede cambiar de dirección / de gráfico guía
 MOD_FLIP_MARGIN = int(os.environ.get("MOD_FLIP_MARGIN", "2"))  # puntos de ventaja que necesita la mano contraria para invertir la dirección
 MOD_W_ALERT    = int(os.environ.get("MOD_W_ALERT", "2"))      # puntos por cada disparador (X/R/S) activo en esta ronda
-COL3_MIN_ROADS = int(os.environ.get("COL3_MIN_ROADS", "2"))  # C3: gráficos que deben coincidir en la misma mano
+MOD_MIN_ROADS = int(os.environ.get("MOD_MIN_ROADS", os.environ.get("COL3_MIN_ROADS", "2")))  # gráficos que deben coincidir (alerta + filtros del nivel) en la misma mano para enviar señal, en C2, C2.5 y C3
 AUDIT_SAVE_EVERY = int(os.environ.get("AUDIT_SAVE_EVERY", "20"))
 
 # ── Validación de manos: cada lado debe traer 2 o 3 cartas legibles. Si no, se consulta de nuevo a la API ──
@@ -1750,9 +1754,9 @@ def enqueue_tracked_send(thread_id: int, text: str) -> dict:
     enqueue_job(job)
     return holder
 
-def enqueue_delete(holder: Optional[dict], thread_id: int = THREAD_SIGNALS):
+def enqueue_delete(holder: Optional[dict], thread_id: int = THREAD_SIGNALS, force: bool = False):
     """Borra un mensaje enviado con enqueue_tracked_send (se encola después de su envío, así que el id ya existe)."""
-    if KEEP_MESSAGES or holder is None or holder.get("queued_delete"):
+    if (KEEP_MESSAGES and not force) or holder is None or holder.get("queued_delete"):
         return
     holder["queued_delete"] = True
 
@@ -2394,6 +2398,8 @@ class BaccaratTable:
         self.emasm = {k: LevelMod() for k in ROAD_DEFS}     # 4 gráficos de nivel (G1–G4) + EMAs 4/8/20 del Moderado, continuos entre zapatos
         self.mod_fresh: dict = {}                           # gráficos que recibieron una marca nueva en la última mano
         self.mod_wait = 0                                   # rondas extra de espera tras resolver una señal
+        self.mod_possible: Optional[dict] = None            # aviso "POSIBLE ENTRADA" pendiente de confirmar/descartar {"side","holder"}
+        self.mod_partial: Optional[str] = None              # lado con alerta válida pero sin la coincidencia de gráficos requerida
         self.mod_cands: list = []                           # disparadores de la última mano (con mano a apostar definida)
         self.road_fed = {k: 0 for k in ROAD_DEFS}           # marcas de cada gráfico ya contadas en el zapato actual
         self.in_coup = False              # True mientras se procesa la mano de ESTA mesa (para el encabezado de ronda)
@@ -2490,6 +2496,7 @@ class BaccaratTable:
         self.shoe_reset_pending = False
         self.shoe_reset_old = set()
         self.last_reset_ts = time.time()
+        self._mod_drop_possible("descartada (cambio de zapato)")
         prev = shoe_results(self)             # zapato que termina (para el pie del descarte)
         self.shoe_snapshot = prev
         self.shoe_id += 1
@@ -2640,7 +2647,9 @@ class BaccaratTable:
         que es lo que genera `cand`); cada nivel añade más EMAs a favor (acumulativo):
           C2   = Moderado + EMA 10/30/10 del MISMO gráfico a favor del color.
           C2.5 = C2 + EMA 20/50/100 + cruce EMA 4/8 a favor (más exigente, sin llegar a C3).
-          C3   = C2.5 + EMA 20/50/20 a favor + al menos COL3_MIN_ROADS gráficos coincidiendo en la misma mano.
+          C3   = C2.5 + EMA 20/50/20 a favor.
+        Esta función evalúa UN gráfico; en los tres niveles, detect_moderate exige además que al menos MOD_MIN_ROADS (2) gráficos
+        distintos pasen el filtro del nivel y coincidan en la misma mano.
         Los filtros EMA no bloquean mientras el gráfico no tenga datos suficientes (igual que antes)."""
         road, color = cand["road"], cand["color"]
         g = f"G{ROAD_DEFS[road]['num']}"
@@ -2656,9 +2665,6 @@ class BaccaratTable:
         if col >= 3:
             if not self.emas[road].allows(color):
                 return False, f"{nm}: EMA 20/50/20 de {g} no apoya {lado}"
-            n_roads = len({x["road"] for x in cands})
-            if n_roads < COL3_MIN_ROADS:
-                return False, f"{nm}: solo {n_roads} gráfico(s) coinciden (mín. {COL3_MIN_ROADS})"
         return True, ""
 
     def _mod_weights(self) -> dict:
@@ -2694,6 +2700,7 @@ class BaccaratTable:
     def detect_moderate(self, r: str):
         """¿Hay entrada AHORA? Alertas de los gráficos → mano a apostar (mayoría de gráficos; empate = no entrar) → filtro de la
         columna actual (C2/C2.5/C3). Devuelve el diccionario de la señal o None."""
+        self.mod_partial = None
         if r == "T" or not self.mod_cands:
             return None
         votes = {"P": [], "B": []}
@@ -2713,14 +2720,33 @@ class BaccaratTable:
         if not passed:
             log.info(f"[{self.label}] 🚫 {COLS.label()}: alerta {side_label(side)} sin filtro → " + " | ".join(why))
             return None
+        roads_ok = sorted({x["road"] for x in passed})
+        if len(roads_ok) < MOD_MIN_ROADS:
+            self.mod_partial = side            # alerta válida en algún gráfico, falta la coincidencia → POSIBLE entrada
+            log.info(f"[{self.label}] 🚫 {COLS.label()}: alerta {side_label(side)} solo en {len(roads_ok)} gráfico(s) que pasan el filtro "
+                     f"({', '.join(roads_ok)}); se necesitan {MOD_MIN_ROADS}")
+            return None
         c = passed[0]
         rd = ROAD_DEFS[c["road"]]
         info = {"engine": "moderate", "road": c["road"], "road_name": rd["name"], "symbol": rd["symbol"],
                 "pattern": "+".join(c["kinds"]), "kinds": list(c["kinds"]), "target": c["color"], "bet_side": side,
-                "col": col, "scale": COLS.scale, "roads": sorted({x["road"] for x in cands}),
-                "n_roads": len({x["road"] for x in cands}), "confirm": "", "line_focus": rd["symbol"] == "/",
+                "col": col, "scale": COLS.scale, "roads": roads_ok,
+                "n_roads": len(roads_ok), "confirm": "", "line_focus": rd["symbol"] == "/",
                 "levels": {k: self.emasm[k].snapshot() for k in ROAD_DEFS}, "all_candidates": []}
         return info
+
+    def _mod_send_possible(self, side: str):
+        """Aviso de texto (sin foto). Se borra al confirmar (entra la señal) o al descartar."""
+        self.round_msg_sent = True
+        self.mod_possible = {"side": side, "holder": enqueue_tracked_send(THREAD_SIGNALS, POSSIBLE_TEXT)}
+        log.info(f"[{self.label}] ⚠️ Posible entrada {side_label(side)}: pendiente de confirmar en esta ronda")
+
+    def _mod_drop_possible(self, why: str = ""):
+        pend, self.mod_possible = self.mod_possible, None
+        if pend:
+            enqueue_delete(pend["holder"], force=True)
+            if why:
+                log.info(f"[{self.label}] 🗑 Posible entrada {why}: aviso borrado")
 
     def start_signal_mod(self, det: dict, live: bool):
         col = det["col"]
@@ -3109,8 +3135,8 @@ class BaccaratTable:
             self._process_coup_core(r, seed, hand)
         finally:
             self.in_coup = False
-        if not seed and not self.round_msg_sent and self.shoe_hands:
-            notify_round(self, self.shoe_hands[-1])
+        if ENGINE != "moderate" and not seed and not self.round_msg_sent and self.shoe_hands:
+            notify_round(self, self.shoe_hands[-1])     # el motor Moderado no publica el resultado de cada ronda
 
     def _process_coup_core(self, r: str, seed: bool = False, hand: Optional[dict] = None):
         if hand is None:
@@ -3217,16 +3243,26 @@ class BaccaratTable:
         if live and self._other_confirmed() is not None:
             return   # hay una entrada confirmada en otra mesa: no se envían señales hasta que se resuelva
         if ENGINE == "moderate":
+            self.mod_partial = None
             if sig is not None:                 # la señal se resolvió en ESTA ronda: no se evalúa hasta la siguiente
                 self.mod_wait = max(0, MOD_COOLDOWN - 1)
+                self._mod_drop_possible("descartada")
                 log.info(f"[{self.label}] ⏸ Señal resuelta: se espera {max(1, MOD_COOLDOWN)} ronda(s) antes de volver a evaluar")
                 return
             if self.mod_wait > 0:
                 self.mod_wait -= 1
+                self._mod_drop_possible("descartada")
                 return
             det = self.detect_moderate(r)
-            if det:
+            pend = self.mod_possible
+            if det:                             # coincidencia completa: entra (si había aviso pendiente, esta es la confirmación)
+                self._mod_drop_possible("confirmada" if pend and pend["side"] == det["bet_side"] else "reemplazada")
                 self.start_signal_mod(det, live)
+                return
+            if pend:                            # la ronda pasó sin confirmarse
+                self._mod_drop_possible("descartada")
+            if self.mod_partial and r != "T":   # nueva alerta válida pero sin coincidencia aún → aviso para la ronda que viene
+                self._mod_send_possible(self.mod_partial)
             return
         if sig is not None and r != "T":
             # Se acaba de resolver/cerrar una señal: un patrón que salió durante ella y ya confirmó su 1.ª marca se envía
